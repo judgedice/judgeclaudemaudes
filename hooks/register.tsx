@@ -2,36 +2,66 @@
 // the upstream's: a countdown line, pings 5 minutes before the cache would expire, never on a
 // cold cache. The judge layer is new: when the cache is about to expire, the thread is filed into
 // a GitHub manifest (threads/<account>/<session>.json); with keep-warm on, the ping itself is the
-// judge, its reply the thread's summary; a judge action in that repository bundles every thread
-// into projects, and at session start the mod says which open threads already cover this project.
+// judge, its reply the thread's summary; the mod bundles every thread into projects, and at session
+// start it says which open threads already cover this project. A pane lists them beside the chat;
+// threads merge within a project, and a deleted thread leaves the manifest for its project's
+// sub-manifest (projects/<slug>.json) as one line.
+import { update } from 'claude-code'
 import type { EngineInterface, ModelUsage, Register, SessionUsage } from 'claude-code'
 
-import type { JudgeVerdict, KeepWarmPing, KeepWarmSaved, KeepWarmTtl, Manifest, ManifestProject, ThreadEntry } from '../types'
+import type {
+  ArchivedThread,
+  JudgeVerdict,
+  KeepWarmPing,
+  KeepWarmSaved,
+  KeepWarmTtl,
+  Manifest,
+  ManifestProject,
+  ManifestThread,
+  PaneEdit,
+  ProjectArchive,
+  ThreadEntry,
+} from '../types'
+import { ago, mdCode, mdText, plural, projectMarkdown, summaryQuote, threadsReply } from './format'
 import type { Assignment } from './judge'
 import {
+  ARCHIVE_DIR,
+  ENTRY_GONE,
   JUDGE_PROMPT,
   MANIFEST_FILE,
   THREADS_DIR,
+  TRANSCRIPT_GONE,
+  addToArchives,
+  archiveJson,
+  archivePath,
+  archivedFrom,
+  attachArchives,
   bundle,
   bundlePrompt,
   describeThread,
   entryJson,
+  findThreads,
   fromBase64,
   keptEntries,
   localVerdict,
   manifestJson,
+  parseArchive,
   parseAssignment,
   parseEntry,
   parseManifest,
   parseRepo,
   parseVerdict,
+  pathSegment,
+  previousAssignment,
+  projectOf,
   relatedThreads,
   renderMarkdown,
   statusOf,
   threadPath,
-  unplacedThreads,
   titleFrom,
   toBase64,
+  tombstones,
+  unplacedThreads,
 } from './judge'
 
 const HOUR_MS = 60 * 60_000
@@ -101,6 +131,7 @@ const ACCOUNT_OPTION = 'account_label'
 const TOKEN_OPTION = 'github_token'
 const FILE_THREADS_OPTION = 'file_threads'
 const JUDGE_MODEL_OPTION = 'judge_model'
+const SWEEP_OPTION = 'sweep_deleted'
 const MANIFEST_MD = 'MANIFEST.md'
 // Files of the manifest repository are kept in the store by blob sha, so a filing fetches only
 // what changed since the last one.
@@ -123,8 +154,15 @@ const PANE_DECIDE_MS = 6000
 // The thread's title in the line is cut to this many characters.
 const TITLE_SHOWN = 40
 const TITLE_MIN = 12
-// Room the toggle button and the gaps take, in columns, when fitting the details to the line.
+// Room the toggle button and the gaps take, in columns, when fitting the details to the line;
+// and the Threads button beside it.
 const BUTTON_COLUMNS = 14
+const THREADS_BUTTON_COLUMNS = 12
+// A manifest older than this is read again when the person opens the pane.
+const PANE_FRESH_MS = 5 * 60_000
+// The thread titles the pane's buttons show are cut to this.
+const BUTTON_TITLE_MAX = 48
+const FILED_BY: Record<ThreadEntry['filedBy'], string> = { judge: 'by the judge', local: 'local summary', end: 'at the end' }
 const FIT_MARGIN = 4
 // How long a filing's outcome stays lit on the line before it goes back to dim.
 const FLASH_MS = 8000
@@ -150,9 +188,19 @@ const RELATED = { plugin: 'judge-keep-warm', key: 'related' } as const
 const ACTIVE = { plugin: 'judge-keep-warm', key: 'lastActiveAt' } as const
 const MANIFEST_THREADS = { plugin: 'judge-keep-warm', key: 'manifestThreads' } as const
 const MANIFEST_PROJECTS = { plugin: 'judge-keep-warm', key: 'manifestProjects' } as const
-const FILINGS = { plugin: 'judge-keep-warm', key: 'filings' } as const
+const UPDATES = { plugin: 'judge-keep-warm', key: 'updates' } as const
+const UPDATED_AT = { plugin: 'judge-keep-warm', key: 'updatedAt' } as const
+const FLASH_FAILED = { plugin: 'judge-keep-warm', key: 'flashFailed' } as const
 const FLASH_UNTIL = { plugin: 'judge-keep-warm', key: 'flashUntil' } as const
 const TITLE = { plugin: 'judge-keep-warm', key: 'title' } as const
+const MANIFEST = { plugin: 'judge-keep-warm', key: 'manifest' } as const
+const MANIFEST_READ_AT = { plugin: 'judge-keep-warm', key: 'manifestReadAt' } as const
+const MANIFEST_ERROR = { plugin: 'judge-keep-warm', key: 'manifestError' } as const
+const PANE_VIEW = { plugin: 'judge-keep-warm', key: 'paneView' } as const
+const PANE_EDIT = { plugin: 'judge-keep-warm', key: 'paneEdit' } as const
+const PANE_NOTICE = { plugin: 'judge-keep-warm', key: 'paneNotice' } as const
+const IS_BUSY = { plugin: 'judge-keep-warm', key: 'isBusy' } as const
+const SELF_ARCHIVED = { plugin: 'judge-keep-warm', key: 'selfArchived' } as const
 
 // The module's own variables start over on a reload; what must survive one is in $.state.
 const live: {
@@ -186,8 +234,10 @@ const live: {
   // was opened in its place.
   bandSeen: boolean
   paneOpen: boolean
-  // The mod's own version, from its manifest, for the pane and /judge.
+  // The mod's own build, from its manifest or its install folder, for the line, the pane and /judge.
   version: string
+  // Take threads whose session was deleted on this machine out of the manifest.
+  sweepDeleted: boolean
 } = {
   storeKey: '',
   pingPendingUntil: 0,
@@ -214,6 +264,7 @@ const live: {
   bandSeen: false,
   paneOpen: false,
   version: '',
+  sweepDeleted: true,
 }
 
 function minutes(ms: number) {
@@ -233,13 +284,12 @@ function timeLeft(ms: number) {
   return ms < 60_000 ? 'under a minute left' : `${minutes(ms)} min left`
 }
 
-// The counter's parts: what the manifest held at the last filing (or at start), and how many
-// filings this session made. Empty before any of them is known.
-function counter(threads: number, projects: number, filings: number) {
-  const plural = (n: number, word: string) => `${n} ${word}${n === 1 ? '' : 's'}`
+// The counter's parts: what the manifest held when last read or written, and the tally of
+// updates this session made to it. Empty before any of them is known.
+function counter(threads: number, projects: number, updates: number) {
   const parts: string[] = []
   if (threads > 0 || projects > 0) parts.push(plural(threads, 'thread'), plural(projects, 'project'))
-  if (filings > 0) parts.push(`${filings} filed`)
+  if (updates > 0) parts.push(plural(updates, 'update'))
   return parts
 }
 
@@ -460,6 +510,7 @@ async function githubJson<T>($: EngineInterface, method: string, path: string, w
 
 type RepoHead = { branch: string; commit: string; tree: string }
 type TreeEntry = { path: string; sha: string; type: string }
+type RepoFile = { path: string; text: string }
 
 // The default branch and its head commit and tree; null while the repository has no commit.
 async function repoHead($: EngineInterface): Promise<RepoHead | null> {
@@ -498,15 +549,16 @@ async function pruneBlobs($: EngineInterface, keep: Set<string>) {
   }
 }
 
-// One commit of several files on the default branch: their blobs, a tree over the head's, the
-// commit, the branch moved to it. False when the branch moved meanwhile (another machine filed
-// a thread): the caller reads the repository again and retries over the new head.
-async function commitFiles($: EngineInterface, head: RepoHead, files: { path: string; text: string }[], message: string) {
-  const tree: { path: string; mode: '100644'; type: 'blob'; sha: string }[] = []
+// One commit of several files on the default branch: their blobs, a tree over the head's (a null
+// sha deletes a path), the commit, the branch moved to it. False when the branch moved meanwhile
+// (another machine filed a thread): the caller reads the repository again and retries.
+async function commitFiles($: EngineInterface, head: RepoHead, files: RepoFile[], deletes: string[], message: string) {
+  const tree: { path: string; mode: '100644'; type: 'blob'; sha: string | null }[] = []
   for (const f of files) {
     const b = await githubJson<{ sha: string }>($, 'POST', `/repos/${live.repo}/git/blobs`, `writing ${f.path}`, { content: toBase64(f.text), encoding: 'base64' })
     tree.push({ path: f.path, mode: '100644', type: 'blob', sha: b.sha })
   }
+  for (const path of deletes) tree.push({ path, mode: '100644', type: 'blob', sha: null })
   const t = await githubJson<{ sha: string }>($, 'POST', `/repos/${live.repo}/git/trees`, 'writing the tree', { base_tree: head.tree, tree })
   const c = await githubJson<{ sha: string }>($, 'POST', `/repos/${live.repo}/git/commits`, 'writing the commit', { message, tree: t.sha, parents: [head.commit] })
   const r = await githubFetch($, 'PATCH', `/repos/${live.repo}/git/refs/heads/${head.branch}`, { sha: c.sha })
@@ -574,29 +626,11 @@ async function gitSync($: EngineInterface, dir: string) {
   return branch
 }
 
-// What the clone holds: every thread entry, and the manifest's projects.
-async function snapshotGit($: EngineInterface, dir: string, sessionId: string) {
-  const entries: ThreadEntry[] = []
-  const threads = `${dir}/${THREADS_DIR}`
-  if (await $.fs.exists(threads)) {
-    for (const account of await $.fs.list(threads)) {
-      if (account.kind !== 'dir') continue
-      for (const file of await $.fs.list(`${threads}/${account.name}`)) {
-        if (file.kind !== 'file' || !file.name.endsWith('.json')) continue
-        const parsed = parseEntry(await $.fs.read(`${threads}/${account.name}/${file.name}`))
-        if (parsed && parsed.sessionId !== sessionId) entries.push(parsed)
-      }
-    }
-  }
-  const manifestPath = `${dir}/${MANIFEST_FILE}`
-  const previous = (await $.fs.exists(manifestPath)) ? (parseManifest(await $.fs.read(manifestPath))?.projects ?? []) : []
-  return { entries, previous }
-}
-
-// Writes the files into the clone, commits and pushes. False when the push was rejected because
-// the branch moved: the caller syncs again and retries.
-async function commitGit($: EngineInterface, dir: string, branch: string, files: { path: string; text: string }[], message: string) {
+// Writes the files into the clone, removes the deleted ones, commits and pushes. False when the
+// push was rejected because the branch moved: the caller syncs again and retries.
+async function commitGit($: EngineInterface, dir: string, branch: string, files: RepoFile[], deletes: string[], message: string) {
   for (const f of files) await $.fs.write(`${dir}/${f.path}`, f.text)
+  if (deletes.length > 0) await git($, dir, ['rm', '-q', '--ignore-unmatch', '--', ...deletes])
   await git($, dir, ['add', '-A'])
   await git($, dir, ['-c', 'user.name=judge-keep-warm', '-c', 'user.email=judge-keep-warm@users.noreply.github.com', 'commit', '-q', '-m', message])
   try {
@@ -644,66 +678,223 @@ async function classify($: EngineInterface, threads: readonly ThreadEntry[], pre
   return assigned ?? []
 }
 
-// Reads every thread in the repository, puts this entry among them, bundles them all into the
-// manifest, and commits the entry, manifest.json and MANIFEST.md together: what is pushed is
-// already classified. Retried over a head another machine moved meanwhile, and once more over
-// the git fallback when the host's proxy refuses REST writes.
-async function publish($: EngineInterface, entry: ThreadEntry) {
-  const path = threadPath(entry.account, entry.sessionId)
-  for (let attempt = 0; attempt < 3; attempt++) {
-    let entries: ThreadEntry[]
-    let previous: ManifestProject[]
-    let isNew: boolean
-    let write: (files: { path: string; text: string }[], message: string) => Promise<boolean>
-    if (live.backend === 'git') {
-      const dir = await gitDir($)
-      const branch = await gitSync($, dir)
-      const snap = await snapshotGit($, dir, entry.sessionId)
-      entries = snap.entries
-      previous = snap.previous
-      isNew = !(await $.fs.exists(`${dir}/${path}`))
-      write = (files, message) => commitGit($, dir, branch, files, message)
-    } else {
-      let head = await repoHead($)
-      if (!head) {
-        await bootstrapRepo($)
-        head = await repoHead($)
-        if (!head) throw new Error(`${live.repo} stays empty after its first commit`)
-      }
-      const tree = await readTree($, head.tree)
-      const keep = new Set<string>()
-      entries = []
-      previous = []
-      for (const e of tree) {
-        if (e.path.startsWith(`${THREADS_DIR}/`) && e.path.endsWith('.json')) {
-          keep.add(e.sha)
-          const parsed = parseEntry(await readBlob($, e.sha))
-          if (parsed && parsed.sessionId !== entry.sessionId) entries.push(parsed)
-        } else if (e.path === MANIFEST_FILE) {
-          keep.add(e.sha)
-          previous = parseManifest(await readBlob($, e.sha))?.projects ?? []
-        }
-      }
-      await pruneBlobs($, keep)
-      isNew = !tree.some(e => e.path === path)
-      const at = head
-      write = (files, message) => commitFiles($, at, files, message)
+// ---- The manifest transaction -----------------------------------------------------------------
+
+// What the repository holds at its head (every thread entry with its path, the manifest's
+// projects, every project's sub-manifest), and how to commit over that head.
+type Snapshot = {
+  entries: { path: string; entry: ThreadEntry }[]
+  previous: ManifestProject[]
+  archives: { path: string; archive: ProjectArchive }[]
+  hasPath: (path: string) => Promise<boolean>
+  write: (files: RepoFile[], deletes: string[], message: string) => Promise<boolean>
+}
+
+// Through GitHub's REST git data: one tree read, the blobs from the store when seen before.
+async function snapshotApi($: EngineInterface): Promise<Snapshot> {
+  let head = await repoHead($)
+  if (!head) {
+    await bootstrapRepo($)
+    head = await repoHead($)
+    if (!head) throw new Error(`${live.repo} stays empty after its first commit`)
+  }
+  const tree = await readTree($, head.tree)
+  const keep = new Set<string>()
+  const entries: Snapshot['entries'] = []
+  const archives: Snapshot['archives'] = []
+  let previous: ManifestProject[] = []
+  for (const e of tree) {
+    if (e.path.startsWith(`${THREADS_DIR}/`) && e.path.endsWith('.json')) {
+      keep.add(e.sha)
+      const entry = parseEntry(await readBlob($, e.sha))
+      if (entry) entries.push({ path: e.path, entry })
+    } else if (e.path.startsWith(`${ARCHIVE_DIR}/`) && e.path.endsWith('.json')) {
+      keep.add(e.sha)
+      const archive = parseArchive(await readBlob($, e.sha))
+      if (archive) archives.push({ path: e.path, archive })
+    } else if (e.path === MANIFEST_FILE) {
+      keep.add(e.sha)
+      previous = parseManifest(await readBlob($, e.sha))?.projects ?? []
     }
-    entries.push(entry)
-    const now = Date.parse(entry.filedAt)
-    const kept = keptEntries(entries, now)
-    const assigned = await classify($, unplacedThreads(kept.filter(t => statusOf(t, now) !== 'closed')), previous)
-    const manifest: Manifest = { schema: 1, generatedAt: entry.filedAt, projects: bundle(kept, assigned, previous, now) }
-    const files = [
-      { path, text: entryJson(entry) },
-      { path: MANIFEST_FILE, text: manifestJson(manifest) },
-      { path: MANIFEST_MD, text: renderMarkdown(manifest) },
-    ]
-    const verb = entry.status === 'closed' ? 'close' : 'file'
-    const message = `judge: ${verb} ${entry.title.slice(0, 60)} (${entry.account}); ${kept.length} threads in ${manifest.projects.length} projects`
+  }
+  await pruneBlobs($, keep)
+  const paths = new Set(tree.map(e => e.path))
+  const at = head
+  return { entries, previous, archives, hasPath: async path => paths.has(path), write: (files, deletes, message) => commitFiles($, at, files, deletes, message) }
+}
+
+// Through the clone, once the host refused a REST write.
+async function snapshotGit($: EngineInterface): Promise<Snapshot> {
+  const dir = await gitDir($)
+  const branch = await gitSync($, dir)
+  const entries: Snapshot['entries'] = []
+  const archives: Snapshot['archives'] = []
+  if (await $.fs.exists(`${dir}/${THREADS_DIR}`)) {
+    for (const account of await $.fs.list(`${dir}/${THREADS_DIR}`)) {
+      if (account.kind !== 'dir') continue
+      for (const file of await $.fs.list(`${dir}/${THREADS_DIR}/${account.name}`)) {
+        if (file.kind !== 'file' || !file.name.endsWith('.json')) continue
+        const path = `${THREADS_DIR}/${account.name}/${file.name}`
+        const entry = parseEntry(await $.fs.read(`${dir}/${path}`))
+        if (entry) entries.push({ path, entry })
+      }
+    }
+  }
+  if (await $.fs.exists(`${dir}/${ARCHIVE_DIR}`)) {
+    for (const file of await $.fs.list(`${dir}/${ARCHIVE_DIR}`)) {
+      if (file.kind !== 'file' || !file.name.endsWith('.json')) continue
+      const path = `${ARCHIVE_DIR}/${file.name}`
+      const archive = parseArchive(await $.fs.read(`${dir}/${path}`))
+      if (archive) archives.push({ path, archive })
+    }
+  }
+  const manifestPath = `${dir}/${MANIFEST_FILE}`
+  const previous = (await $.fs.exists(manifestPath)) ? (parseManifest(await $.fs.read(manifestPath))?.projects ?? []) : []
+  return {
+    entries,
+    previous,
+    archives,
+    hasPath: path => $.fs.exists(`${dir}/${path}`),
+    write: (files, deletes, message) => commitGit($, dir, branch, files, deletes, message),
+  }
+}
+
+/** What one commit to the manifest repository is asked to do; `by` names who asked. */
+type Change = {
+  /** This session's own entry, filed. */
+  entry?: ThreadEntry
+  /** Fold `drop` into `keep`, all of one project. */
+  merge?: { keep: string; drop: string[] }
+  /** Take these threads out by hand. */
+  remove?: string[]
+  by: string
+}
+
+/** What it came to. `kind`: this thread's entry `created` or `updated`; `archived` when a merge or
+ * deletion took this thread out (it is not filed again); `committed` for a commit with no entry of
+ * this thread's; `unchanged` when there was nothing to write. */
+type Outcome = {
+  kind: 'created' | 'updated' | 'archived' | 'committed' | 'unchanged'
+  path: string
+  manifest: Manifest
+  threads: number
+  projects: number
+  /** Every thread this commit took out, the deletion hook's among them. */
+  archived: ArchivedThread[]
+  /** The threads the deletion hook took out: their session or their entry file was gone. */
+  cleared: ArchivedThread[]
+  self: ArchivedThread | null
+}
+
+function commitMessage(self: ThreadEntry | undefined, keepTitle: string, archived: readonly ArchivedThread[], threads: number, projects: number) {
+  const parts: string[] = []
+  if (self) parts.push(`${self.status === 'closed' ? 'close' : 'file'} ${self.title.slice(0, 60)} (${self.account})`)
+  const merged = archived.filter(a => a.reason === 'merged')
+  const byHand = archived.filter(a => a.reason === 'deleted' && a.by !== TRANSCRIPT_GONE && a.by !== ENTRY_GONE)
+  const cleared = archived.length - merged.length - byHand.length
+  if (merged.length) parts.push(`merge ${plural(merged.length, 'thread')} into ${keepTitle.slice(0, 60)}`)
+  if (byHand.length) parts.push(`delete ${byHand.map(a => a.title.slice(0, 40)).join(', ')}`)
+  if (cleared) parts.push(`archive ${plural(cleared, 'deleted thread')}`)
+  return `judge: ${parts.join('; ') || 'tidy'}; ${threads} threads in ${projects} projects`
+}
+
+// The one way the repository changes: reads every thread entry, the manifest and the projects'
+// sub-manifests; files this thread's entry, merges or deletes what was asked, and takes out every
+// thread that was deleted (its session's transcript gone from this machine, or its entry file
+// gone from the repository), each kept as one line in its project's sub-manifest; bundles what
+// is left into the manifest; and commits it all at once. A thread a sub-manifest holds is never
+// listed again. Retried over a head another machine moved meanwhile, and once more over the git
+// fallback when the host's proxy refuses REST writes.
+async function transact($: EngineInterface, change: Change): Promise<Outcome> {
+  const now = await $.clock.now()
+  const at = change.entry?.filedAt ?? new Date(now).toISOString()
+  await hostNames($)
+  const local = await localSessionIds($)
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const snap = live.backend === 'git' ? await snapshotGit($) : await snapshotApi($)
+    const archives = snap.archives.map(a => a.archive)
+    const archivePaths = new Map(snap.archives.map(a => [a.archive, a.path]))
+    const dead = tombstones(archives)
+    const latest = new Map<string, ThreadEntry>()
+    for (const { entry } of snap.entries) {
+      const have = latest.get(entry.sessionId)
+      if (!have || entry.filedAt > have.filedAt) latest.set(entry.sessionId, entry)
+    }
+    const self = change.entry
+    const selfRecord = self ? (archives.flatMap(a => a.threads).find(t => t.sessionId === self.sessionId) ?? null) : null
+    const isFiling = self !== undefined && selfRecord === null
+    if (isFiling) latest.set(self.sessionId, self)
+
+    const records: { record: ArchivedThread; entry?: ThreadEntry }[] = []
+    const isListed = (id: string) => latest.has(id) && !dead.has(id)
+    const take = (t: ThreadEntry | ManifestThread, reason: ArchivedThread['reason'], by: string, into?: string) => {
+      if (dead.has(t.sessionId) || records.some(r => r.record.sessionId === t.sessionId)) return false
+      records.push({ record: archivedFrom(t, reason, by, at, into), entry: latest.get(t.sessionId) })
+      return true
+    }
+    if (change.merge) {
+      const { keep, drop } = change.merge
+      if (!isListed(keep)) throw new Error(`the thread to keep (${keep.slice(0, 8)}) is not in the manifest any more`)
+      const home = projectOf(snap.previous, keep)?.slug
+      for (const id of drop) {
+        if (id === keep) continue
+        const entry = latest.get(id)
+        if (!entry || !isListed(id)) throw new Error(`thread ${id.slice(0, 8)} is not in the manifest any more`)
+        if (projectOf(snap.previous, id)?.slug !== home) throw new Error('threads merge only within one project, and these are in different ones')
+        take(entry, 'merged', change.by, keep)
+      }
+    }
+    for (const id of change.remove ?? []) {
+      const entry = latest.get(id)
+      if (!entry || !isListed(id)) throw new Error(`thread ${id.slice(0, 8)} is not in the manifest any more`)
+      take(entry, 'deleted', change.by)
+    }
+    // The deletion hook. A thread this machine filed whose session's transcript is gone was
+    // deleted in Claude Code; a thread the manifest lists whose entry file is gone was deleted in
+    // the repository. Either leaves a line in its project's sub-manifest.
+    const cleared: ArchivedThread[] = []
+    if (local) {
+      for (const [id, entry] of latest) {
+        if (id === self?.sessionId || local.has(id) || entry.account !== accountLabel() || entry.host !== live.host) continue
+        if (take(entry, 'deleted', TRANSCRIPT_GONE)) cleared.push(records[records.length - 1]!.record)
+      }
+    }
+    for (const t of snap.previous.flatMap(p => p.threads)) {
+      if (latest.has(t.sessionId) || t.status === 'closed') continue
+      if (take(t, 'deleted', ENTRY_GONE)) cleared.push(records[records.length - 1]!.record)
+    }
+
+    const out = new Set([...dead, ...records.map(r => r.record.sessionId)])
+    const kept = keptEntries([...latest.values()].filter(t => !out.has(t.sessionId)), now)
+    const deletes = [...new Set(snap.entries.filter(e => out.has(e.entry.sessionId)).map(e => e.path))]
+    const listedCount = snap.previous.reduce((n, p) => n + p.threads.length, 0)
+    if (!isFiling && records.length === 0 && deletes.length === 0) {
+      const manifest: Manifest = { schema: 1, generatedAt: at, projects: snap.previous }
+      return { kind: selfRecord ? 'archived' : 'unchanged', path: '', manifest, threads: listedCount, projects: snap.previous.length, archived: [], cleared: [], self: selfRecord }
+    }
+    // A filing bundles anew through the model; a merge or a deletion keeps every other thread in
+    // the project it was in.
+    const assigned = isFiling ? await classify($, unplacedThreads(kept.filter(t => statusOf(t, now) !== 'closed')), snap.previous) : previousAssignment(snap.previous)
+    const projects = bundle(kept, assigned, snap.previous, now)
+    const changed = addToArchives(archives, records, snap.previous, projects)
+    const orphans = attachArchives(projects, archives)
+    const manifest: Manifest = { schema: 1, generatedAt: at, projects }
+    const files: RepoFile[] = []
+    let path = ''
+    let isNew = false
+    if (isFiling) {
+      path = threadPath(self.account, self.sessionId)
+      isNew = !(await snap.hasPath(path))
+      files.push({ path, text: entryJson(self) })
+    }
+    for (const a of changed) files.push({ path: archivePaths.get(a) ?? archivePath(a.slug), text: archiveJson(a) })
+    files.push({ path: MANIFEST_FILE, text: manifestJson(manifest) }, { path: MANIFEST_MD, text: renderMarkdown(manifest, orphans) })
+    const archived = records.map(r => r.record)
+    const keepTitle = change.merge ? (latest.get(change.merge.keep)?.title ?? '') : ''
+    const message = commitMessage(isFiling ? self : undefined, keepTitle, archived, kept.length, projects.length)
     let isDone: boolean
     try {
-      isDone = await write(files, message)
+      isDone = await snap.write(files, deletes, message)
     } catch (err) {
       if (live.backend === 'api' && isWriteRefused(err)) {
         live.backend = 'git'
@@ -713,11 +904,173 @@ async function publish($: EngineInterface, entry: ThreadEntry) {
       throw err
     }
     if (isDone) {
-      await $.state.set(RELATED, relatedThreads(manifest, entry.sessionId, entry.repo, entry.cwd))
-      return { path, outcome: isNew ? 'created' : 'updated', projects: manifest.projects.length, threads: kept.length }
+      await rememberManifest($, manifest)
+      await noteUpdate($)
+      const kind = isFiling ? (isNew ? 'created' : 'updated') : selfRecord ? 'archived' : 'committed'
+      return { kind, path, manifest, threads: kept.length, projects: projects.length, archived, cleared, self: selfRecord }
     }
   }
   throw new Error('the manifest branch kept moving under the commit; try again')
+}
+
+// The manifest as last read or written: for the pane, the line's counter, the related threads,
+// and whether this thread was taken out of it.
+async function rememberManifest($: EngineInterface, manifest: Manifest) {
+  const sessionId = await $.session.id()
+  const repo = await $.session.repo()
+  await $.state.set(MANIFEST, manifest)
+  await $.state.set(MANIFEST_READ_AT, await $.clock.now())
+  await $.state.set(MANIFEST_ERROR, '')
+  await $.state.set(RELATED, relatedThreads(manifest, sessionId, repo?.remote ?? null, await $.session.cwd()))
+  await $.state.set(MANIFEST_THREADS, manifest.projects.reduce((n, p) => n + p.threads.length, 0))
+  await $.state.set(MANIFEST_PROJECTS, manifest.projects.length)
+  const self = manifest.projects.flatMap(p => p.archived ?? []).find(a => a.sessionId === sessionId)
+  if (self) await $.state.set(SELF_ARCHIVED, self)
+}
+
+// The session ids whose transcripts this machine keeps (`<config>/projects/<dir>/<id>.jsonl`), so
+// the deletion hook can tell which of its threads' sessions are gone. Null where that cannot be
+// told safely: the option is off, a cloud container (whose transcripts never persist), or this
+// session's own transcript is not among them (another layout, another config directory).
+async function localSessionIds($: EngineInterface): Promise<Set<string> | null> {
+  if (!live.sweepDeleted || (await $.env.get('CLAUDE_CODE_REMOTE')) === 'true') return null
+  try {
+    const home = (await $.env.get('HOME')) ?? (await $.env.get('USERPROFILE')) ?? ''
+    const config = ((await $.env.get('CLAUDE_CONFIG_DIR')) ?? '').trim() || (home ? `${home}/.claude` : '')
+    const root = `${config}/projects`
+    if (!config || !(await $.fs.exists(root))) return null
+    const ids = new Set<string>()
+    for (const dir of await $.fs.list(root)) {
+      if (dir.kind !== 'dir') continue
+      for (const file of await $.fs.list(`${root}/${dir.name}`)) {
+        if (file.kind === 'file' && file.name.endsWith('.jsonl')) ids.add(file.name.slice(0, -'.jsonl'.length))
+      }
+    }
+    return ids.has(await $.session.id()) ? ids : null
+  } catch {
+    return null
+  }
+}
+
+// At session start, with the manifest read: when a thread it lists was deleted (its session on
+// this machine, or its entry file in the repository), one commit takes it out.
+async function sweepDeleted($: EngineInterface, entryIds: ReadonlySet<string> | null) {
+  if (!isJudging() || live.isFiling) return
+  const { value: manifest = null } = await $.state.get(MANIFEST)
+  if (!manifest) return
+  await hostNames($)
+  const local = await localSessionIds($)
+  const threads = manifest.projects.flatMap(p => p.threads).filter(t => t.status !== 'closed')
+  const isGone = (t: ManifestThread) =>
+    (entryIds !== null && !entryIds.has(t.sessionId)) || (local !== null && t.account === accountLabel() && t.host === live.host && !local.has(t.sessionId))
+  if (!threads.some(isGone)) return
+  live.isFiling = true
+  try {
+    const done = await transact($, { by: accountLabel() })
+    const n = done.cleared.length
+    if (n > 0) $.ui.toast(`Judge: ${plural(n, 'deleted thread')} taken out of the manifest; ${n === 1 ? 'its' : 'their'} one-line summary is in ${n === 1 ? 'its' : 'their'} project's sub-manifest.`)
+  } catch (err) {
+    $.ui.log(`judge: taking deleted threads out of the manifest failed: ${err instanceof Error ? err.message : String(err)}`, { to: 'debug' })
+  } finally {
+    live.isFiling = false
+  }
+}
+
+// A merge or a deletion asked for by hand (the pane or /judge), one at a time with the filings.
+async function changeThreads($: EngineInterface, change: Omit<Change, 'by' | 'entry'>): Promise<{ ok: true; done: Outcome } | { ok: false; error: string }> {
+  if (live.isFiling) return { ok: false, error: 'a filing is under way; try again in a moment' }
+  live.isFiling = true
+  try {
+    await hostNames($)
+    return { ok: true, done: await transact($, { ...change, by: accountLabel() }) }
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : String(err) }
+  } finally {
+    live.isFiling = false
+  }
+}
+
+// What a merge or a deletion did, in one markdown paragraph and a list.
+function changeReply(done: Outcome, project: string) {
+  const merged = done.archived.filter(a => a.reason === 'merged')
+  const deleted = done.archived.filter(a => a.reason === 'deleted')
+  const keep = merged[0]?.into ? done.manifest.projects.flatMap(p => p.threads).find(t => t.sessionId === merged[0]!.into) : undefined
+  const lines: string[] = []
+  if (merged.length) lines.push(`**Merged ${plural(merged.length, 'thread')}** into **${mdText(keep?.title ?? merged[0]!.into ?? '')}** in *${mdText(project)}*.`)
+  if (deleted.length) lines.push(`**Deleted ${plural(deleted.length, 'thread')}** from *${mdText(project)}*.`)
+  lines.push('', ...done.archived.map(a => `- ~~${mdText(a.title)}~~: ${mdText(a.brief)}`), '')
+  lines.push(`${done.archived.length === 1 ? 'Its' : 'Their'} one-line summary is kept in the project's sub-manifest under ${mdCode(`${ARCHIVE_DIR}/`)}.`)
+  return lines.join('\n')
+}
+
+function selfArchivedText(self: ArchivedThread, manifest: Manifest | null) {
+  if (self.reason === 'merged') {
+    const into = manifest?.projects.flatMap(p => p.threads).find(t => t.sessionId === self.into)
+    return `merged into “${into?.title ?? self.into?.slice(0, 8) ?? '?'}” on ${self.archivedAt.slice(0, 10)}; it is no longer filed`
+  }
+  return `taken out of the manifest on ${self.archivedAt.slice(0, 10)}; it is no longer filed`
+}
+
+// The pane's picks on one project: a press picks a thread or lets it go; the first picked is kept.
+function togglePick(current: PaneEdit | undefined, slug: string, sessionId: string): PaneEdit {
+  const picked = current && current.slug === slug ? current.picked : []
+  return { slug, picked: picked.includes(sessionId) ? picked.filter(id => id !== sessionId) : [...picked, sessionId] }
+}
+
+function clipTitle(title: string) {
+  const one = title.replace(/\s+/g, ' ').trim()
+  return one.length > BUTTON_TITLE_MAX ? `${one.slice(0, BUTTON_TITLE_MAX - 1)}…` : one || 'Untitled'
+}
+
+// Opens the Judgeiverse pane at the person's ask (a command or a press), and reads the manifest
+// again when what the pane would list is more than a few minutes old. Says whether it is placed.
+async function showPane($: EngineInterface) {
+  const isPlaced = await openPane($)
+  const { value: readAt = 0 } = await $.state.get(MANIFEST_READ_AT)
+  if ((await $.clock.now()) - readAt > PANE_FRESH_MS) void refreshPane($)
+  return isPlaced
+}
+
+async function refreshPane($: EngineInterface) {
+  const { value: isBusy = false } = await $.state.get(IS_BUSY)
+  if (isBusy) return
+  await $.state.set(IS_BUSY, true)
+  try {
+    await loadRelated($, true)
+    const { value: error = '' } = await $.state.get(MANIFEST_ERROR)
+    await $.state.set(PANE_NOTICE, error ? `Reading the manifest failed: ${error}` : '')
+  } finally {
+    await $.state.set(IS_BUSY, false)
+  }
+}
+
+// The pane's Merge or Delete on the picked threads of the project it edits.
+async function paneAction($: EngineInterface, action: 'merge' | 'delete') {
+  const { value: edit = null } = await $.state.get(PANE_EDIT)
+  const { value: isBusy = false } = await $.state.get(IS_BUSY)
+  if (!edit || edit.picked.length === 0 || isBusy) return
+  if (action === 'merge' && edit.picked.length < 2) return
+  await $.state.set(IS_BUSY, true)
+  await $.state.set(PANE_NOTICE, action === 'merge' ? 'Merging…' : 'Deleting…')
+  try {
+    const [keep = '', ...drop] = edit.picked
+    const r = await changeThreads($, action === 'merge' ? { merge: { keep, drop } } : { remove: edit.picked })
+    if (!r.ok) {
+      await $.state.set(PANE_NOTICE, `${action === 'merge' ? 'Merge' : 'Delete'} failed: ${r.error}`)
+      return
+    }
+    const n = r.done.archived.filter(a => a.reason === (action === 'merge' ? 'merged' : 'deleted')).length
+    const keepTitle = r.done.manifest.projects.flatMap(p => p.threads).find(t => t.sessionId === keep)?.title ?? ''
+    await $.state.set(
+      PANE_NOTICE,
+      action === 'merge'
+        ? `Merged ${plural(n, 'thread')} into “${clipTitle(keepTitle)}”; the one-line summaries are in the project's sub-manifest.`
+        : `Deleted ${plural(n, 'thread')}; the one-line summaries are in the project's sub-manifest.`,
+    )
+    await $.state.set(PANE_EDIT, null)
+  } finally {
+    await $.state.set(IS_BUSY, false)
+  }
 }
 
 // What build this is, for the pane and /judge: the manifest's version when it carries one, else
@@ -735,7 +1088,12 @@ async function readVersion($: EngineInterface) {
     const leaf = $.plugin.root.split(/[\\/]/).filter(Boolean).pop() ?? ''
     if (leaf && leaf !== $.plugin.name) version = /^[0-9a-f]{40}$/.test(leaf) ? leaf.slice(0, 7) : leaf
   }
-  live.version = version
+  live.version = version || 'dev'
+}
+
+// The build as the line shows it: `v0.4.0` for a release, the commit or `dev` as it is.
+function buildLabel() {
+  return /^\d+\.\d+/.test(live.version) ? `v${live.version}` : live.version
 }
 
 // Opens the pane that stands in for the band; says whether a surface placed it.
@@ -750,8 +1108,17 @@ async function openPane($: EngineInterface) {
   }
 }
 
-// Lights the line with the last filing's outcome for FLASH_MS, then lets it go dim again. The
-// timer clears the key (the write redraws the line); the tick clears one a reload left behind.
+// Every commit this session makes to the manifest: the tally goes up, and the line lights with it.
+async function noteUpdate($: EngineInterface) {
+  const { value: updates = 0 } = await $.state.get(UPDATES)
+  await $.state.set(UPDATES, updates + 1)
+  await $.state.set(UPDATED_AT, await $.clock.now())
+  await $.state.set(FLASH_FAILED, false)
+  await flash($)
+}
+
+// Lights the line with the last update's or failure's outcome for FLASH_MS, then lets it go dim
+// again. The timer clears the key (the write redraws the line); the tick clears one a reload left.
 async function flash($: EngineInterface) {
   const until = (await $.clock.now()) + FLASH_MS
   await $.state.set(FLASH_UNTIL, until)
@@ -771,6 +1138,8 @@ async function fileThread($: EngineInterface, verdict: JudgeVerdict, by: ThreadE
   live.isFiling = true
   const t = await $.clock.now()
   let path = ''
+  // The expiry this filing is for: filed or failed, the thread is not filed again before it.
+  let expiresAt = 0
   try {
     await hostNames($)
     const sessionId = await $.session.id()
@@ -786,7 +1155,7 @@ async function fileThread($: EngineInterface, verdict: JudgeVerdict, by: ThreadE
     const surfaces = await $.session.surfaces()
     const title = (await readTitle($)) || titleFrom(messages, cwd)
     await $.state.set(TITLE, title)
-    const expiresAt = last > 0 ? last + (ttl?.ms ?? HOUR_MS) : 0
+    expiresAt = last > 0 ? last + (ttl?.ms ?? HOUR_MS) : 0
     const entry: ThreadEntry = {
       schema: 1,
       sessionId,
@@ -813,20 +1182,28 @@ async function fileThread($: EngineInterface, verdict: JudgeVerdict, by: ThreadE
       resume: `claude --resume ${sessionId}`,
     }
     path = threadPath(entry.account, sessionId)
-    const done = await publish($, entry)
+    const done = await transact($, { entry, by: accountLabel() })
+    if (done.kind === 'archived' && done.self) {
+      // A merge or a deletion took this thread out: it is not filed again.
+      const { value: wasArchived = null } = await $.state.get(SELF_ARCHIVED)
+      await $.state.set(SELF_ARCHIVED, done.self)
+      await $.state.set(FILED_FOR, expiresAt)
+      if (!wasArchived) $.ui.toast(`Judge: this thread was ${selfArchivedText(done.self, done.manifest)}.`)
+      return
+    }
     const { value: was = null } = await $.state.get(FILING)
     await $.state.set(FILING, { at: t, ok: true, path, error: '', by })
     await $.state.set(FILED_FOR, expiresAt)
     await $.state.set(MANIFEST_THREADS, done.threads)
     await $.state.set(MANIFEST_PROJECTS, done.projects)
-    const { value: filings = 0 } = await $.state.get(FILINGS)
-    await $.state.set(FILINGS, filings + 1)
-    await flash($)
-    if (!was || !was.ok || by !== 'judge') $.ui.toast(`Judge: thread ${done.outcome} in ${live.repo}; ${done.threads} threads in ${done.projects} projects.`)
+    const cleared = done.cleared.length ? ` ${plural(done.cleared.length, 'deleted thread')} taken out.` : ''
+    if (!was || !was.ok || by !== 'judge' || cleared) $.ui.toast(`Judge: thread ${done.kind} in ${live.repo}; ${done.threads} threads in ${done.projects} projects.${cleared}`)
   } catch (err) {
     const error = err instanceof Error ? err.message : String(err)
     const { value: was = null } = await $.state.get(FILING)
     await $.state.set(FILING, { at: t, ok: false, path, error, by })
+    if (expiresAt > 0) await $.state.set(FILED_FOR, expiresAt)
+    await $.state.set(FLASH_FAILED, true)
     await flash($)
     if (!was || was.ok || was.error !== error) $.ui.toast(`Judge: filing the thread failed: ${error}`, { timeoutMs: 8000 })
   } finally {
@@ -851,33 +1228,33 @@ async function judgeAndFile($: EngineInterface, status: ThreadEntry['status']) {
   return verdict
 }
 
-// Reads manifest.json and keeps the open threads that share this session's repository or
-// directory, so the line and the start-of-session notice can point at them.
-async function loadRelated($: EngineInterface, isQuiet: boolean) {
-  if (!isJudging()) return []
+// Reads manifest.json and keeps it (the pane draws it), and the open threads that share this
+// session's repository or directory, so the line and the start-of-session notice can point at
+// them. Also answers which threads have an entry file, for the deletion hook.
+async function loadRelated($: EngineInterface, isQuiet: boolean): Promise<{ related: ManifestThread[]; entryIds: Set<string> | null }> {
+  const none = { related: [], entryIds: null }
+  if (!isJudging()) return none
   try {
     const head = await repoHead($)
-    if (!head) return []
-    const found = (await readTree($, head.tree)).find(e => e.path === MANIFEST_FILE)
+    if (!head) return none
+    const tree = await readTree($, head.tree)
+    const found = tree.find(e => e.path === MANIFEST_FILE)
     const manifest = found ? parseManifest(await readBlob($, found.sha)) : null
-    if (!manifest) return []
-    const repo = await $.session.repo()
-    const related = relatedThreads(manifest, await $.session.id(), repo?.remote ?? null, await $.session.cwd())
-    await $.state.set(RELATED, related)
-    // The counter's first figures, until this session's first filing brings newer ones.
-    const { value: filings = 0 } = await $.state.get(FILINGS)
-    if (filings === 0) {
-      await $.state.set(MANIFEST_THREADS, manifest.projects.reduce((n, p) => n + p.threads.length, 0))
-      await $.state.set(MANIFEST_PROJECTS, manifest.projects.length)
-    }
+    if (!manifest) return none
+    await rememberManifest($, manifest)
+    const { value: related = [] } = await $.state.get(RELATED)
     if (related.length > 0 && !isQuiet) {
       const named = related.slice(0, RELATED_SHOWN).map(describeThread).join('; ')
-      $.ui.toast(`Judge: ${related.length} open thread${related.length === 1 ? '' : 's'} already cover this project: ${named}. /judge threads lists them.`, { timeoutMs: 12_000 })
+      $.ui.toast(`Judge: ${related.length} open thread${related.length === 1 ? '' : 's'} already cover this project: ${named}. /judge panel shows them.`, { timeoutMs: 12_000 })
     }
-    return related
-  } catch {
+    const files = tree.filter(e => e.path.startsWith(`${THREADS_DIR}/`) && e.path.endsWith('.json')).map(e => e.path.slice(e.path.lastIndexOf('/') + 1, -'.json'.length))
+    const segments = new Set(files)
+    const entryIds = new Set(manifest.projects.flatMap(p => p.threads).filter(t => segments.has(pathSegment(t.sessionId))).map(t => t.sessionId))
+    return { related, entryIds }
+  } catch (err) {
     // No manifest yet, no token, or no network: nothing to point at.
-    return []
+    await $.state.set(MANIFEST_ERROR, err instanceof Error ? err.message : String(err))
+    return none
   }
 }
 
@@ -1086,12 +1463,15 @@ async function lineModel($: EngineInterface) {
   const { value: related = [] } = await $.state.get(RELATED)
   const { value: manifestThreads = 0 } = await $.state.get(MANIFEST_THREADS)
   const { value: manifestProjects = 0 } = await $.state.get(MANIFEST_PROJECTS)
-  const { value: filings = 0 } = await $.state.get(FILINGS)
+  const { value: updates = 0 } = await $.state.get(UPDATES)
+  const { value: updatedAt = 0 } = await $.state.get(UPDATED_AT)
+  const { value: flashFailed = false } = await $.state.get(FLASH_FAILED)
   const { value: flashUntil = 0 } = await $.state.get(FLASH_UNTIL)
+  const { value: selfArchived = null } = await $.state.get(SELF_ARCHIVED)
   const isBlocked = (!sawResponse || waits) && nearlyFull
-  // Lit for FLASH_MS after a filing: green on a manifest update, red on a failure.
-  const isFlash = isJudging() && filing !== null && flashUntil > 0 && (await $.clock.now()) < flashUntil
-  const flashColor = filing?.ok ? 'green' : 'red'
+  // Lit for FLASH_MS after a commit to the manifest (green) or a failed filing (red).
+  const isFlash = isJudging() && flashUntil > 0 && (await $.clock.now()) < flashUntil && (flashFailed ? filing !== null : updatedAt > 0)
+  const flashColor = flashFailed ? 'red' : 'green'
 
   const t = Math.max(now, last)
   const ttlMs = ttl?.ms ?? HOUR_MS
@@ -1131,16 +1511,19 @@ async function lineModel($: EngineInterface) {
     else parts.push(`${tokens(contextTokens)} cached`)
   }
 
-  // The judge's part: when the thread was last filed, or that filing failed; and how many
-  // other open threads the manifest holds for this project.
+  // The judge's part: when this session last updated the manifest, or that a filing failed; how
+  // many other open threads the manifest holds for this project; and the tally of updates.
   if (isJudging()) {
-    if (filing && !isFlash) parts.push(filing.ok ? `filed ${clockTime(filing.at)}` : 'filing failed')
+    if (selfArchived) parts.push(selfArchived.reason === 'merged' ? 'merged into another thread' : 'taken out of the manifest')
+    else if (!isFlash && filing && !filing.ok && filing.at >= updatedAt) parts.push('filing failed')
+    else if (!isFlash && updatedAt > 0) parts.push(`manifest updated ${clockTime(updatedAt)}`)
+    if (updates > 0) parts.push(plural(updates, 'update'))
     if (related.length > 0) parts.push(`${related.length} related thread${related.length === 1 ? '' : 's'}`)
-    parts.push(...counter(manifestThreads, manifestProjects, filings))
+    parts.push(...counter(manifestThreads, manifestProjects, 0))
   }
 
   const canToggle = isOn || !ttl || canKeepWarm || ttl.reason === 'overage' || ttl.reason === 'observed'
-  const flashText = filing ? (filing.ok ? `✓ manifest updated ${clockTime(filing.at)}` : '✗ filing failed') : ''
+  const flashText = flashFailed ? '✗ filing failed' : `✓ manifest updated ${clockTime(updatedAt)}`
   const { value: fullTitle = '' } = await $.state.get(TITLE)
   const title = fullTitle.length > TITLE_SHOWN ? `${fullTitle.slice(0, TITLE_SHOWN - 1)}…` : fullTitle
   return { isFlash, flashColor, flashText, isGreen, circle, filled, main, expiresText, parts, canToggle, isOn, title }
@@ -1153,6 +1536,7 @@ export const register: Register = (on, options) => {
   live.tokenOption = String(options[TOKEN_OPTION] ?? '')
   live.fileThreads = options[FILE_THREADS_OPTION] !== false
   live.judgeModel = String(options[JUDGE_MODEL_OPTION] ?? '').trim()
+  live.sweepDeleted = options[SWEEP_OPTION] !== false
 
   on('session.start', async ($, e, next) => {
     await $.command.register({
@@ -1163,8 +1547,8 @@ export const register: Register = (on, options) => {
     })
     await $.command.register({
       name: JUDGE_COMMAND,
-      description: 'The thread manifest: status, file or close this thread, list the open threads of this project, open the pane',
-      argumentHint: '[status | file | close | threads | pane]',
+      description: 'The thread manifest: status, file or close this thread, list the open threads of this project, open the pane, merge or delete threads',
+      argumentHint: '[status | file | close | threads | pane | merge <keep> <other>… | delete <id>…]',
       immediate: true,
     })
 
@@ -1200,8 +1584,9 @@ export const register: Register = (on, options) => {
     $.clock.every(TICK_MS, () => void tick($))
     void syncTitle($)
     $.clock.every(TITLE_SYNC_MS, () => void syncTitle($))
-    // The related threads come from the network: never hold the start on them.
-    void loadRelated($, false)
+    // The related threads come from the network: never hold the start on them. Once read, any
+    // thread deleted since (its session here, or its entry in the repository) is taken out.
+    void loadRelated($, false).then(r => sweepDeleted($, r.entryIds))
     // Where nothing has drawn the band by now, the pane shows the line instead.
     $.clock.after(PANE_DECIDE_MS, () => {
       if (!live.bandSeen && !live.paneOpen) void openPane($)
@@ -1337,45 +1722,79 @@ export const register: Register = (on, options) => {
   })
 
   on('command.run', { command: JUDGE_COMMAND }, async ($, e) => {
-    const [word = 'status'] = e.args.trim().toLowerCase().split(/\s+/)
+    const [first = 'status', ...rest] = e.args.trim().split(/\s+/).filter(Boolean)
+    const word = first.toLowerCase()
     if (!isJudging()) {
-      return { text: `Judge: no manifest repository is set. Set "Manifest repository" to owner/repo in /config (plugin ${PLUGIN_NAME}); an empty private repository is enough.` }
+      return { text: `**Judge:** no manifest repository is set. Set **Manifest repository** to \`owner/repo\` in \`/config\` (plugin ${PLUGIN_NAME}); an empty private repository is enough.` }
     }
-    if (word === 'pane') {
-      const isPlaced = await openPane($)
-      return { text: isPlaced ? 'Judge: the Judgeiverse pane is open.' : 'Judge: no surface here places a pane; the line is drawn above the prompt where one exists.' }
+    if (word === 'pane' || word === 'panel') {
+      const isPlaced = await showPane($)
+      return { text: isPlaced ? '**Judge:** the Judgeiverse pane is open: the line, then the threads.' : '**Judge:** no surface here places a pane; the line is drawn above the prompt where one exists, and `/judge threads` lists the threads.' }
     }
     if (word === 'file' || word === 'close') {
       const verdict = await judgeAndFile($, word === 'close' ? 'closed' : 'open')
       const { value: filing = null } = await $.state.get(FILING)
-      const lines = [
-        filing?.ok ? `Judge: thread ${word === 'close' ? 'closed' : 'filed'} at ${filing.path} in ${live.repo}, manifest bundled.` : `Judge: filing failed: ${filing?.error ?? 'unknown'}`,
-        verdict.summary,
-      ]
-      if (verdict.project) lines.push(`Project: ${verdict.project}`)
-      if (verdict.topics.length) lines.push(`Topics: ${verdict.topics.join(', ')}`)
-      if (verdict.nextStep) lines.push(`Next: ${verdict.nextStep}`)
+      const { value: self = null } = await $.state.get(SELF_ARCHIVED)
+      const { value: manifest = null } = await $.state.get(MANIFEST)
+      const head = self
+        ? `**Not filed:** this thread was ${mdText(selfArchivedText(self, manifest))}.`
+        : filing?.ok
+          ? `**Thread ${word === 'close' ? 'closed' : 'filed'}** at ${mdCode(filing.path)} in ${mdCode(live.repo)}; manifest bundled.`
+          : `**Filing failed:** ${mdText(filing?.error ?? 'unknown')}`
+      const lines = [head, '', summaryQuote(verdict.summary)]
+      const facts: string[] = []
+      if (verdict.project) facts.push(`- **Project:** ${mdText(verdict.project)}`)
+      if (verdict.topics.length) facts.push(`- **Topics:** ${verdict.topics.map(mdText).join(', ')}`)
+      if (verdict.nextStep) facts.push(`- **Next:** ${mdText(verdict.nextStep)}`)
+      if (facts.length) lines.push('', ...facts)
       return { text: lines.join('\n') }
     }
     if (word === 'threads') {
-      const related = await loadRelated($, true)
-      if (related.length === 0) return { text: `Judge: no other open thread in the manifest covers this project (repository or directory).` }
-      return { text: [`Judge: ${related.length} open thread${related.length === 1 ? '' : 's'} cover this project:`, ...related.map(r => `- ${describeThread(r)}\n  ${r.summary}\n  ${r.resume}`)].join('\n') }
+      const { related } = await loadRelated($, true)
+      return { text: threadsReply(related, await $.clock.now()) }
+    }
+    if (word === 'merge' || word === 'delete') {
+      const usage = word === 'merge'
+        ? '**Judge:** `/judge merge <keep> <other>…` folds the other threads into the first, all of one project. Name each by its session id or its first eight characters; `/judge pane` lets you pick them instead.'
+        : '**Judge:** `/judge delete <id>…` takes threads out of the manifest and keeps one line on each in its project\'s sub-manifest. Name each by its session id or its first eight characters.'
+      if (rest.length < (word === 'merge' ? 2 : 1)) return { text: usage }
+      await loadRelated($, true)
+      const { value: manifest = null } = await $.state.get(MANIFEST)
+      const { value: error = '' } = await $.state.get(MANIFEST_ERROR)
+      if (!manifest) return { text: `**Judge:** the manifest could not be read${error ? `: ${mdText(error)}` : ''}.` }
+      const { found, errors } = findThreads(manifest.projects, rest)
+      if (errors.length) return { text: `**Judge:** ${errors.join('; ')}.` }
+      const projectNames = [...new Set(found.map(f => f.project.name))]
+      if (word === 'merge' && projectNames.length > 1) {
+        return { text: `**Judge:** threads merge only within one project, and these are in ${projectNames.map(n => `*${mdText(n)}*`).join(' and ')}.` }
+      }
+      if (word === 'merge' && found.length < 2) return { text: usage }
+      const ids = found.map(f => f.thread.sessionId)
+      const [keep = '', ...drop] = ids
+      const r = await changeThreads($, word === 'merge' ? { merge: { keep, drop } } : { remove: ids })
+      if (!r.ok) return { text: `**Judge:** the ${word} failed: ${mdText(r.error)}` }
+      return { text: changeReply(r.done, projectNames.join(', ')) }
     }
     const { value: verdict = null } = await $.state.get(VERDICT)
     const { value: filing = null } = await $.state.get(FILING)
     const { value: related = [] } = await $.state.get(RELATED)
-    const lines = [
-      `Judge${live.version ? ` ${live.version}` : ''}: manifest ${live.repo}, account "${accountLabel()}", ${live.fileThreads ? 'files this thread when its cache is about to expire' : 'files only on /judge file'}.`,
-      filing ? (filing.ok ? `Last filed ${clockTime(filing.at)} (${filing.by}) at ${filing.path}.` : `Last filing ${clockTime(filing.at)} failed: ${filing.error}`) : 'Not filed yet this session.',
-    ]
-    if (verdict) lines.push(`Verdict: ${verdict.summary}${verdict.project ? ` (project: ${verdict.project})` : ''}`)
-    if (related.length) lines.push(`${related.length} other open thread${related.length === 1 ? '' : 's'} cover this project; /judge threads lists them.`)
+    const { value: self = null } = await $.state.get(SELF_ARCHIVED)
+    const { value: manifest = null } = await $.state.get(MANIFEST)
     const { value: manifestThreads = 0 } = await $.state.get(MANIFEST_THREADS)
     const { value: manifestProjects = 0 } = await $.state.get(MANIFEST_PROJECTS)
-    const { value: filings = 0 } = await $.state.get(FILINGS)
-    lines.push(`Manifest: ${counter(manifestThreads, manifestProjects, filings).join(' · ') || 'not read yet'}.`)
-    lines.push('Commands: /judge file, /judge close, /judge threads, /judge pane')
+    const { value: updates = 0 } = await $.state.get(UPDATES)
+    const { value: updatedAt = 0 } = await $.state.get(UPDATED_AT)
+    const lines = [
+      `**Judge** ${mdText(buildLabel())} · manifest ${mdCode(live.repo)} · account ${mdCode(accountLabel())}`,
+      '',
+      `- **Filing:** ${live.fileThreads ? "when this thread's cache is about to expire" : 'only on `/judge file`'}`,
+      `- **Last filed:** ${filing ? (filing.ok ? `${clockTime(filing.at)}, ${FILED_BY[filing.by]}, at ${mdCode(filing.path)}` : `${clockTime(filing.at)}, failed: ${mdText(filing.error)}`) : 'not yet this session'}`,
+    ]
+    if (self) lines.push(`- **This thread:** ${mdText(selfArchivedText(self, manifest))}`)
+    if (verdict) lines.push(`- **Verdict:** ${mdText(verdict.summary)}${verdict.project ? ` *(project: ${mdText(verdict.project)})*` : ''}`)
+    lines.push(`- **Manifest:** ${counter(manifestThreads, manifestProjects, updates).join(' · ') || 'not read yet'}${updatedAt ? `; last updated ${clockTime(updatedAt)}` : ''}`)
+    if (related.length) lines.push(`- **This project:** ${plural(related.length, 'other open thread')}; \`/judge threads\` lists them`)
+    lines.push('', '`/judge file` · `/judge close` · `/judge threads` · `/judge pane` · `/judge merge <keep> <other>…` · `/judge delete <id>…`')
     return { text: lines.join('\n') }
   })
 
@@ -1387,9 +1806,10 @@ export const register: Register = (on, options) => {
     const m = await lineModel($)
     // The title leads the details; the rest follows as far as the width allows.
     const details = [...(m.title ? [m.title] : []), ...m.parts]
+    const build = buildLabel()
     const fixed =
-      LABEL.length + DETAIL_GAP + 1 + DETAIL_GAP + BAR_CELLS + DETAIL_GAP + m.main.length + m.expiresText.length +
-      (m.isFlash ? DETAIL_GAP + m.flashText.length : 0) + (m.canToggle ? BUTTON_COLUMNS : 0)
+      LABEL.length + DETAIL_GAP + build.length + DETAIL_GAP + 1 + DETAIL_GAP + BAR_CELLS + DETAIL_GAP + m.main.length + m.expiresText.length +
+      (m.isFlash ? DETAIL_GAP + m.flashText.length : 0) + (m.canToggle ? BUTTON_COLUMNS : 0) + (isJudging() ? THREADS_BUTTON_COLUMNS : 0)
     const shown = fitParts(details, e.props.bodyColumns, fixed)
 
     return (
@@ -1397,6 +1817,9 @@ export const register: Register = (on, options) => {
         <Box flexGrow={1} flexShrink={1} minWidth={0} overflow="hidden" flexWrap="nowrap" alignItems="center" columnGap={DETAIL_GAP}>
           <Box flexShrink={0} width={LABEL.length}>
             {m.isFlash ? <Text color={m.flashColor} bold>{LABEL}</Text> : <Text color={LABEL_COLOR}>{LABEL}</Text>}
+          </Box>
+          <Box flexShrink={0}>
+            <Text dimColor>{build}</Text>
           </Box>
           <Box flexShrink={0}>
             {m.isGreen ? <Text color="green" bold>{m.circle}</Text> : <Text dimColor>{m.circle}</Text>}
@@ -1419,6 +1842,11 @@ export const register: Register = (on, options) => {
             <Box flexShrink={0}>{m.title !== '' && p === shown[0] && details[0] === m.title ? <Text>{p}</Text> : <Text dimColor>{p}</Text>}</Box>,
           ])}
         </Box>
+        {isJudging() && (
+          <Box flexShrink={0}>
+            <Button key="threads" label="Threads" onPress={() => showPane($)} />
+          </Box>
+        )}
         {m.canToggle && (
           <Box flexShrink={0}>
             <Button
@@ -1434,8 +1862,100 @@ export const register: Register = (on, options) => {
 
   // The same line as a pane, in rows, where no band is drawn (a cloud session's chat).
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
-    const { Box, Button, Text } = $.ui.resolve(e)
+    const { Box, Button, Markdown, Text } = $.ui.resolve(e)
     const m = await lineModel($)
+    // Below the line: this project's threads, or every project's, each project with its
+    // archived threads and an edit mode that merges or deletes the threads picked.
+    async function threadsSection() {
+      const { value: manifest = null } = await $.state.get(MANIFEST)
+      const { value: readAt = 0 } = await $.state.get(MANIFEST_READ_AT)
+      const { value: error = '' } = await $.state.get(MANIFEST_ERROR)
+      const { value: view = 'project' } = await $.state.get(PANE_VIEW)
+      const { value: edit = null } = await $.state.get(PANE_EDIT)
+      const { value: notice = '' } = await $.state.get(PANE_NOTICE)
+      const { value: isBusy = false } = await $.state.get(IS_BUSY)
+      const { value: related = [] } = await $.state.get(RELATED)
+      const { value: selfArchived = null } = await $.state.get(SELF_ARCHIVED)
+      const { value: shownAt = 0 } = await $.state.get(NOW)
+      const now = shownAt || (await $.clock.now())
+      const selfId = await $.session.id()
+
+      const all = manifest?.projects ?? []
+      const near = new Set([selfId, ...related.map(t => t.sessionId)])
+      const mine = all.filter(p => p.threads.some(t => near.has(t.sessionId)))
+      const shown = view === 'all' ? all : mine
+      const openIn = (ps: readonly ManifestProject[]) => ps.reduce((n, p) => n + p.threads.filter(t => t.status !== 'closed').length, 0)
+      const head = manifest
+        ? `${plural(openIn(all), 'open thread')} · ${plural(all.length, 'project')} · read ${clockTime(readAt)}`
+        : error
+          ? `manifest not read: ${error}`
+          : 'reading the manifest…'
+
+      const editor = (p: ManifestProject, open: readonly ManifestThread[]) => {
+        const picked = edit?.slug === p.slug ? edit.picked : []
+        const keep = open.find(t => t.sessionId === picked[0])
+        return (
+          <Box flexDirection="column">
+            <Text dimColor>Pick the thread to keep first, then the ones to fold into it; or pick threads to delete.</Text>
+            {open.map(t => {
+              const at = picked.indexOf(t.sessionId)
+              return (
+                <Button key={`pick:${t.sessionId}`} plain onPress={() => update($, PANE_EDIT, current => togglePick(current ?? undefined, p.slug, t.sessionId))}>
+                  {`${at >= 0 ? `[${at + 1}]` : '[ ]'} ${clipTitle(t.title)}`} <Text dimColor>{`${t.account} · ${ago(t.lastActiveAt, now)}`}</Text>
+                </Button>
+              )
+            })}
+            <Box flexDirection="row" flexWrap="wrap" columnGap={1}>
+              {picked.length >= 2 && keep && (
+                <Button key={`merge:${p.slug}`} variant="primary" label={`Merge ${picked.length - 1} into “${clipTitle(keep.title)}”`} onPress={() => paneAction($, 'merge')} />
+              )}
+              {picked.length >= 1 && <Button key={`delete:${p.slug}`} label={`Delete ${picked.length}`} onPress={() => paneAction($, 'delete')} />}
+              <Button key={`cancel:${p.slug}`} label="Cancel" onPress={() => $.state.set(PANE_EDIT, null)} />
+            </Box>
+          </Box>
+        )
+      }
+
+      const section = (p: ManifestProject) => {
+        const open = p.threads.filter(t => t.status !== 'closed')
+        const isEditing = edit?.slug === p.slug
+        const counts = [plural(open.length, 'open thread'), ...(p.archived?.length ? [`${p.archived.length} archived`] : [])].join(' · ')
+        return (
+          <Box flexDirection="column">
+            <Box flexDirection="row" flexWrap="wrap" columnGap={1} alignItems="center">
+              <Text bold>{p.name}</Text>
+              <Text dimColor>{counts}</Text>
+              {!isEditing && open.length > 0 && (
+                <Button key={`edit:${p.slug}`} label="Merge or delete" onPress={() => $.state.set(PANE_EDIT, { slug: p.slug, picked: [] })} />
+              )}
+            </Box>
+            {isEditing ? editor(p, open) : <Markdown text={projectMarkdown(p, now, selfId, view === 'project')} />}
+          </Box>
+        )
+      }
+
+      return (
+        <Box flexDirection="column" rowGap={1} marginTop={1}>
+          <Box flexDirection="row" flexWrap="wrap" columnGap={1} alignItems="center">
+            <Text bold>Threads</Text>
+            <Text dimColor>{head}</Text>
+          </Box>
+          <Box flexDirection="row" flexWrap="wrap" columnGap={1}>
+            <Button key="view-project" label={`This project (${openIn(mine)})`} variant={view === 'project' ? 'primary' : 'secondary'} onPress={() => $.state.set(PANE_VIEW, 'project')} />
+            <Button key="view-all" label={`All (${openIn(all)})`} variant={view === 'all' ? 'primary' : 'secondary'} onPress={() => $.state.set(PANE_VIEW, 'all')} />
+            <Button key="refresh" label={isBusy ? 'Working…' : 'Refresh'} onPress={() => refreshPane($)} />
+          </Box>
+          {notice !== '' && <Text dimColor>{notice}</Text>}
+          {selfArchived && <Text color="yellow">{`This thread was ${selfArchivedText(selfArchived, manifest)}.`}</Text>}
+          {manifest && shown.length === 0 && (
+            <Markdown text={view === 'project' ? '*No thread in the manifest covers this repository or directory yet. **All** lists every project.*' : '*The manifest lists no project yet.*'} />
+          )}
+          {shown.map(section)}
+        </Box>
+      )
+    }
+
+    const threads = isJudging() ? await threadsSection() : null
 
     return (
       <Box flexDirection="column" rowGap={0}>
@@ -1464,9 +1984,11 @@ export const register: Register = (on, options) => {
           {m.canToggle && <Button key="toggle" label={m.isOn ? 'Stop' : 'Keep warm'} onPress={() => setKeepWarm($, !m.isOn, 0)} />}
           {isJudging() && <Button key="file" label="File now" onPress={() => void judgeAndFile($, 'open')} />}
         </Box>
-        {live.version !== '' && <Text dimColor>{`${PLUGIN_NAME} ${live.version}`}</Text>}
+        {live.version !== '' && <Text dimColor>{`${PLUGIN_NAME} ${buildLabel()}`}</Text>}
+        {threads}
       </Box>
     )
+
   })
 }
 

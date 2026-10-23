@@ -53,6 +53,12 @@
       "title": "Mark the session title",
       "description": "While keep-warm is on, put a green dot in front of the session's title in the desktop app's session list",
       "default": true
+    },
+    "sweep_deleted": {
+      "type": "boolean",
+      "title": "Take deleted threads out of the manifest",
+      "description": "When a thread this machine filed has had its session deleted (its transcript is gone from ~/.claude/projects), take it out of the manifest and keep a one-line summary in its project's sub-manifest. Never runs in a cloud container, where transcripts do not persist. Entries deleted from the repository by hand are taken out either way.",
+      "default": true
     }
   },
   "homepage": "https://github.com/judgedice/judgeclaudemaudes",

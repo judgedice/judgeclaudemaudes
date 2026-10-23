@@ -1,9 +1,12 @@
 // Pure helpers of the judge layer: nothing here touches `$` (the engine only lets `$` into
 // functions declared in the hooks module itself). Text, JSON and paths alone.
-import type { JudgeVerdict, Manifest, ManifestProject, ManifestThread, ThreadEntry } from '../types'
+import type { ArchivedThread, JudgeVerdict, Manifest, ManifestProject, ManifestThread, ProjectArchive, ThreadEntry } from '../types'
 
 export const THREADS_DIR = 'threads'
 export const MANIFEST_FILE = 'manifest.json'
+// Each project's sub-manifest: the threads merged or deleted out of it, one line each.
+export const ARCHIVE_DIR = 'projects'
+export const BRIEF_MAX = 160
 export const SUMMARY_MAX = 600
 export const TITLE_MAX = 80
 export const TOPICS_MAX = 8
@@ -347,14 +350,15 @@ export function bundle(entries: readonly ThreadEntry[], assigned: Assignment, pr
   return out.sort((a, b) => latest(b).localeCompare(latest(a)))
 }
 
-export function renderMarkdown(manifest: Manifest) {
+export function renderMarkdown(manifest: Manifest, orphans: readonly ProjectArchive[] = []) {
   const lines = [
     '# Open threads',
     '',
-    `Written by Judge Keep Warm at ${manifest.generatedAt}. One section per project; resume a thread with its command on the machine and account it names.`,
+    `Written by Judge Keep Warm at ${manifest.generatedAt}. One section per project; resume a thread with its command on the machine and account it names. Threads merged or deleted out of a project are kept, one line each, in its sub-manifest under \`${ARCHIVE_DIR}/\`.`,
     '',
   ]
   const count = (p: ManifestProject, s: ManifestThread['status']) => p.threads.filter(t => t.status === s).length
+  const cell = (text: string) => text.replace(/\|/g, '\\|').replace(/\s+/g, ' ')
   for (const p of manifest.projects) {
     const open = count(p, 'open')
     const stale = count(p, 'stale')
@@ -363,17 +367,38 @@ export function renderMarkdown(manifest: Manifest) {
     if (p.repos.length) lines.push(`Repositories: ${p.repos.map(r => `\`${r}\``).join(', ')}`, '')
     if (open > 1) lines.push(`> ${open} open threads here. Resume one before opening another.`, '')
     else if (open === 0 && stale > 0) lines.push(`> Nothing active; ${stale} stale thread${stale === 1 ? '' : 's'} left.`, '')
-    lines.push('| Status | Account · host | Thread | Last active | Resume |', '| --- | --- | --- | --- | --- |')
-    for (const t of p.threads) {
-      const when = t.lastActiveAt.slice(0, 16).replace('T', ' ')
-      const title = t.title.replace(/\|/g, '\\|')
-      const summary = t.summary.replace(/\|/g, '\\|').replace(/\s+/g, ' ')
-      lines.push(`| ${t.status} | ${t.account} · ${t.host} | **${title}**<br>${summary} | ${when} | \`${t.resume}\` |`)
+    if (p.threads.length) {
+      lines.push('| Status | Account · host | Thread | Last active | Resume |', '| --- | --- | --- | --- | --- |')
+      for (const t of p.threads) {
+        const when = t.lastActiveAt.slice(0, 16).replace('T', ' ')
+        const merged = t.merged?.length ? `<br>Merged in: ${t.merged.map(m => cell(m.title)).join('; ')}` : ''
+        lines.push(`| ${t.status} | ${t.account} · ${t.host} | **${cell(t.title)}**<br>${cell(t.summary)}${merged} | ${when} | \`${t.resume}\` |`)
+      }
+      lines.push('')
     }
-    lines.push('')
+    if (p.archived?.length) lines.push(...archivedLines(p.archived, p.threads), '')
   }
   if (manifest.projects.length === 0) lines.push('No threads filed yet.', '')
+  for (const a of orphans.filter(a => a.threads.length > 0)) {
+    lines.push(`## ${a.name} (archived)`, '', 'No open thread is listed under this project any more.', '', ...archivedLines(a.threads, []), '')
+  }
   return lines.join('\n')
+}
+
+// A project's archived threads as a collapsed list for MANIFEST.md.
+function archivedLines(archived: readonly ArchivedThread[], threads: readonly ManifestThread[]) {
+  const titleOf = (id: string) => threads.find(t => t.sessionId === id)?.title ?? id.slice(0, 8)
+  const n = archived.length
+  return [
+    `<details><summary>${n} archived thread${n === 1 ? '' : 's'}</summary>`,
+    '',
+    ...archived.map(a => {
+      const how = a.reason === 'merged' ? `merged into ${titleOf(a.into ?? '')}` : deletedHow(a.by)
+      return `- **${a.title.replace(/[*_`]/g, '')}** (${how}, ${a.archivedAt.slice(0, 10)}): ${a.brief}`
+    }),
+    '',
+    '</details>',
+  ]
 }
 
 export function manifestJson(manifest: Manifest) {
@@ -388,4 +413,152 @@ export function parseEntry(text: string): ThreadEntry | null {
   } catch {
     return null
   }
+}
+
+// ---- Merging and deleting: each project's sub-manifest -----------------------------------------
+
+/** What `by` says on a thread the deletion hook took out because its session's transcript is gone. */
+export const TRANSCRIPT_GONE = 'transcript gone'
+/** What `by` says on a thread taken out because its entry file was deleted from the manifest repository. */
+export const ENTRY_GONE = 'entry deleted'
+
+/** How a deleted thread went, in words, by what took it out. */
+export function deletedHow(by: string) {
+  return by === TRANSCRIPT_GONE ? 'session deleted' : by === ENTRY_GONE ? 'entry deleted' : `deleted by ${by}`
+}
+
+export function archivePath(slug: string) {
+  return `${ARCHIVE_DIR}/${pathSegment(slug)}.json`
+}
+
+export function parseArchive(text: string): ProjectArchive | null {
+  try {
+    const a = JSON.parse(text) as ProjectArchive
+    return a && a.schema === 1 && typeof a.slug === 'string' && Array.isArray(a.threads) ? a : null
+  } catch {
+    return null
+  }
+}
+
+export function archiveJson(archive: ProjectArchive) {
+  return `${JSON.stringify(archive, null, 2)}\n`
+}
+
+// One sentence on what a thread was: the judge's first sentence, or what the person started
+// with when the summary is the local one. The title when the summary says nothing.
+export function briefOf(summary: string, title: string) {
+  const text = summary.trim()
+  if (!text || text === 'No messages yet.') return clip(title, BRIEF_MAX)
+  const local = /^Started with:\s*([\s\S]*?)(?:\s+Last answer:[\s\S]*)?$/.exec(text)
+  if (local) return clip(local[1] || title, BRIEF_MAX)
+  const first = /^[\s\S]*?[.!?](?=\s|$)/.exec(text)?.[0] ?? text
+  return clip(first, BRIEF_MAX)
+}
+
+/** One archived record for a thread leaving the manifest: its entry, or the manifest's line when the entry is gone. */
+export function archivedFrom(t: ThreadEntry | ManifestThread, reason: ArchivedThread['reason'], by: string, at: string, into?: string): ArchivedThread {
+  return {
+    sessionId: t.sessionId,
+    account: t.account,
+    host: t.host,
+    title: t.title,
+    brief: briefOf(t.summary, t.title),
+    lastActiveAt: t.lastActiveAt,
+    archivedAt: at,
+    reason,
+    ...(into ? { into } : {}),
+    by,
+  }
+}
+
+/** Every session id a sub-manifest holds: such a thread is never listed again. */
+export function tombstones(archives: readonly ProjectArchive[]) {
+  return new Set(archives.flatMap(a => a.threads.map(t => t.sessionId)))
+}
+
+/** The manifest's projects as an assignment: a merge or a deletion keeps every other thread where it was, with no model call. */
+export function previousAssignment(previous: readonly ManifestProject[]): Assignment {
+  return previous.map(p => ({ name: p.name, description: p.description, threadIds: p.threads.map(t => t.sessionId) }))
+}
+
+/** The project the manifest lists a thread under; undefined when it lists it nowhere. */
+export function projectOf(projects: readonly ManifestProject[], sessionId: string) {
+  return projects.find(p => p.threads.some(t => t.sessionId === sessionId))
+}
+
+/**
+ * The threads the ids name, each a full session id or a prefix of at least four characters,
+ * looked up in the manifest. An id that names none, or several, is an error naming it.
+ */
+export function findThreads(projects: readonly ManifestProject[], ids: readonly string[]) {
+  const found: { project: ManifestProject; thread: ManifestThread }[] = []
+  const errors: string[] = []
+  for (const id of ids) {
+    const want = id.trim()
+    if (want.length < 4) {
+      errors.push(`\`${want}\` is too short to name a thread: give at least four characters of its session id`)
+      continue
+    }
+    const hits = projects.flatMap(project => project.threads.filter(t => t.sessionId === want || t.sessionId.startsWith(want)).map(thread => ({ project, thread })))
+    const exact = hits.filter(h => h.thread.sessionId === want)
+    const pick = exact.length === 1 ? exact : hits
+    if (pick.length === 0) errors.push(`no thread in the manifest has a session id starting \`${want}\``)
+    else if (pick.length > 1) errors.push(`\`${want}\` names ${pick.length} threads; give more of the session id`)
+    else if (!found.some(f => f.thread.sessionId === pick[0]!.thread.sessionId)) found.push(pick[0]!)
+  }
+  return { found, errors }
+}
+
+/**
+ * The manifest's projects with their sub-manifests: each project's archived threads, and on
+ * every surviving thread the threads merged into it. Returns the sub-manifests no listed
+ * project has (their project was renamed or emptied), for MANIFEST.md.
+ */
+export function attachArchives(projects: ManifestProject[], archives: readonly ProjectArchive[]) {
+  const bySlug = new Map(archives.map(a => [a.slug, a]))
+  const all = archives.flatMap(a => a.threads)
+  const newest = (a: ArchivedThread, b: ArchivedThread) => b.archivedAt.localeCompare(a.archivedAt)
+  for (const p of projects) {
+    const archived = [...(bySlug.get(p.slug)?.threads ?? [])].sort(newest)
+    if (archived.length) p.archived = archived
+    else delete p.archived
+    for (const t of p.threads) {
+      const merged = all.filter(a => a.reason === 'merged' && a.into === t.sessionId).sort(newest)
+      if (merged.length) t.merged = merged.map(m => ({ sessionId: m.sessionId, title: m.title, brief: m.brief }))
+      else delete t.merged
+    }
+  }
+  const listed = new Set(projects.map(p => p.slug))
+  return archives.filter(a => !listed.has(a.slug))
+}
+
+/**
+ * A merge's or a deletion's records added to the sub-manifests, each under the project the new
+ * manifest lists its thread's work in: a merge's under its target's project; a deletion's under
+ * the project that held it, as the new manifest names it (same slug, or a project that kept any
+ * of its threads); else its own repository's or fallback project. Returns the ones that changed.
+ */
+export function addToArchives(
+  archives: ProjectArchive[],
+  records: readonly { record: ArchivedThread; entry?: ThreadEntry }[],
+  before: readonly ManifestProject[],
+  after: readonly ManifestProject[],
+) {
+  const changed = new Set<ProjectArchive>()
+  const successor = (p: ManifestProject) =>
+    after.find(a => a.slug === p.slug) ?? after.find(a => a.threads.some(t => p.threads.some(o => o.sessionId === t.sessionId))) ?? p
+  for (const { record, entry } of records) {
+    const was = projectOf(before, record.sessionId)
+    const into = record.into ? (projectOf(after, record.into) ?? projectOf(before, record.into)) : undefined
+    const own = entry ? (repoProject(entry) ?? { ...fallbackProject(entry), slug: slugify(fallbackProject(entry).name) }) : undefined
+    const home = into ?? (was ? successor(was) : undefined) ?? own ?? { name: 'Unsorted', slug: 'unsorted' }
+    let archive = archives.find(a => a.slug === home.slug)
+    if (!archive) {
+      archive = { schema: 1, name: home.name, slug: home.slug, threads: [] }
+      archives.push(archive)
+    }
+    if (!archive.threads.some(t => t.sessionId === record.sessionId)) archive.threads.push(record)
+    changed.add(archive)
+  }
+  return [...changed]
 }

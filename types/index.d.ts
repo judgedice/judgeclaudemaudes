@@ -56,6 +56,9 @@ export type ThreadEntry = {
   resume: string
 }
 
+/** A thread folded into another one, as the survivor lists it in `manifest.json`. */
+export type MergedThread = { sessionId: string; title: string; brief: string }
+
 /** One thread as `manifest.json` lists it under a project (what the judge action writes). */
 export type ManifestThread = {
   sessionId: string
@@ -68,6 +71,37 @@ export type ManifestThread = {
   lastActiveAt: string
   status: ThreadStatus | 'stale'
   resume: string
+  /** The threads merged into this one, newest first; absent when none. */
+  merged?: MergedThread[]
+}
+
+/**
+ * A thread taken out of the manifest, kept as one line in its project's sub-manifest
+ * (`projects/<slug>.json`). Its session id stays a tombstone: a later filing of it is not listed.
+ */
+export type ArchivedThread = {
+  sessionId: string
+  account: string
+  host: string
+  title: string
+  /** One sentence: what the thread was, kept after it left the manifest. */
+  brief: string
+  lastActiveAt: string
+  archivedAt: string
+  /** `merged`: folded into `into`. `deleted`: its session was deleted, or `/judge delete` removed it. */
+  reason: 'merged' | 'deleted'
+  /** The thread it was merged into; merged only. */
+  into?: string
+  /** What took it out: an account label, or `transcript gone` for the deletion hook. */
+  by: string
+}
+
+/** `projects/<slug>.json`: one project's sub-manifest, the threads taken out of it. */
+export type ProjectArchive = {
+  schema: 1
+  name: string
+  slug: string
+  threads: ArchivedThread[]
 }
 
 /** One project of `manifest.json`: a bundle of like threads, named by the judge action. */
@@ -77,6 +111,8 @@ export type ManifestProject = {
   description: string
   repos: string[]
   threads: ManifestThread[]
+  /** Its sub-manifest's threads, newest first; absent when none. */
+  archived?: ArchivedThread[]
 }
 
 /** `manifest.json` as the judge action writes it. */
@@ -88,6 +124,12 @@ export type Manifest = {
 
 /** What the last filing came to, for the line and `/judge`. */
 export type JudgeFiling = { at: number; ok: boolean; path: string; error: string; by: ThreadEntry['filedBy'] }
+
+/** Which threads the pane lists: this project's, or every project's. */
+export type PaneView = 'project' | 'all'
+
+/** The pane's edit mode on one project: the threads picked, in the order picked (the first is kept on a merge). */
+export type PaneEdit = { slug: string; picked: string[] } | null
 
 declare module 'claude-code' {
   interface PluginState {
@@ -132,14 +174,34 @@ declare module 'claude-code' {
       lastActiveAt: number
       /** The thread's title as the line shows it: the app's session title, else the first prompt's first line; '' = unknown. */
       title: string
-      /** Threads the manifest held as of this session's last filing (or its read at start); 0 = not known yet. */
+      /** Threads the manifest held when this session last read or wrote it; 0 = not known yet. */
       manifestThreads: number
-      /** Projects the manifest held as of this session's last filing (or its read at start); 0 = not known yet. */
+      /** Projects the manifest held when this session last read or wrote it; 0 = not known yet. */
       manifestProjects: number
-      /** Successful filings this session made into the manifest. */
-      filings: number
-      /** Until when (ms since epoch) the line shows the last filing's outcome lit; 0 = not lit. */
+      /** Commits this session made to the manifest: filings, merges, deletions, deleted threads taken out. */
+      updates: number
+      /** When this session last updated the manifest (ms since epoch); 0 = not yet. */
+      updatedAt: number
+      /** Until when (ms since epoch) the line shows the last update's or failure's outcome lit; 0 = not lit. */
       flashUntil: number
+      /** True when what the line shows lit is a failed filing, not an update. */
+      flashFailed: boolean
+      /** The manifest as last read or written by this session; null before the first read. */
+      manifest: Manifest | null
+      /** When the manifest was last read or written (ms since epoch); 0 = not yet. */
+      manifestReadAt: number
+      /** Why the last read of the manifest failed; '' = it did not. */
+      manifestError: string
+      /** Which threads the pane lists. */
+      paneView: PaneView
+      /** The project the pane edits (merge or delete), and the threads picked; null = not editing. */
+      paneEdit: PaneEdit
+      /** The pane's last action and how it went, shown under its buttons; '' = none. */
+      paneNotice: string
+      /** True while the pane's action (refresh, merge, delete) runs. */
+      isBusy: boolean
+      /** This thread's own record when a merge or a deletion took it out of the manifest; null = listed. */
+      selfArchived: ArchivedThread | null
     }
   }
 }

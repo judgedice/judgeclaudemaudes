@@ -8,7 +8,7 @@ const OPTIONS = { manifest_repo: 'me/claude-threads', account_label: 'work', git
 const BAND = {
   plugin: 'judge-keep-warm',
   component: 'AbovePrompt',
-  props: { hasSurvey: false, isWorking: false, maxRows: 10, bodyColumns: 200, scroll: { offset: 0, bodyRows: 10 }, view: {} },
+  props: { hasSurvey: false, isWorking: false, maxRows: 10, bodyColumns: 240, scroll: { offset: 0, bodyRows: 10 }, view: {} },
 } as const
 
 test('the judge reply parses into a verdict, and anything else does not', async () => {
@@ -269,7 +269,8 @@ test('/judge file asks the fork for a verdict and files it', { options: OPTIONS 
   const { text } = await $.command.run({ command: 'judge', args: 'file' })
 
   expect(prompt.startsWith('Judge Keep Warm ping.')).toBe(true)
-  expect(text).toContain('thread filed at threads/work/sess-1.json')
+  expect(text).toContain('**Thread filed** at `threads/work/sess-1.json` in `me/claude-threads`; manifest bundled.')
+  expect(text).toContain('- **Next:** run the migration')
   const filed = filedEntries(repo)
   expect(filed.length).toBe(1)
   expect(filed[0]?.entry.filedBy).toBe('judge')
@@ -282,7 +283,7 @@ function hhmm(ms: number) {
   return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`
 }
 
-test('a filing lights the line with the manifest update, then the counter stays', { options: OPTIONS }, async ($, on) => {
+test('a filing lights the line with the manifest update, then the tally stays', { options: OPTIONS }, async ($, on) => {
   const start = 1_700_000_000_000
   const clock = mock.clock(on, { now: start })
   mock.store(on)
@@ -302,23 +303,23 @@ test('a filing lights the line with the manifest update, then the counter stays'
   for (const surface of ['terminal', 'desktop'] as const) {
     const ui = await $.ui.mount({ ...BAND, surface })
     expect((await ui.find({ type: 'Text', text: /Judgeiverse/ }))?.text).toBe('Judgeiverse')
-    expect((await ui.find({ type: 'Text', text: /manifest updated/ }))?.text).toBe(`✓ manifest updated ${hhmm(start)}`)
+    expect((await ui.find({ type: 'Text', text: /^✓ manifest updated/ }))?.text).toBe(`✓ manifest updated ${hhmm(start)}`)
     expect((await ui.find({ type: 'Text', text: /Port the billing job/ }))?.text).toBe('Port the billing job to the queue')
     expect((await ui.find({ type: 'Text', text: /^\d+ threads?$/ }))?.text).toBe('2 threads')
     expect((await ui.find({ type: 'Text', text: /^\d+ projects?$/ }))?.text).toBe('1 project')
-    expect((await ui.find({ type: 'Text', text: /^\d+ filed$/ }))?.text).toBe('1 filed')
-    // While lit, the dim "filed HH:MM" part gives way to the flash.
-    expect(await ui.find({ type: 'Text', text: /^filed / })).toBe(undefined)
+    expect((await ui.find({ type: 'Text', text: /^\d+ updates?$/ }))?.text).toBe('1 update')
+    // While lit, the dim "manifest updated HH:MM" part gives way to the flash.
+    expect(await ui.find({ type: 'Text', text: /^manifest updated / })).toBe(undefined)
     await ui.unmount()
   }
 
-  // Past the flash, the line goes back to dim: the flash is gone, the counter stays.
+  // Past the flash, the line goes back to dim: the flash is gone, the tally stays.
   await clock.advance(8_001)
   for (const surface of ['terminal', 'desktop'] as const) {
     const ui = await $.ui.mount({ ...BAND, surface })
-    expect(await ui.find({ type: 'Text', text: /manifest updated/ })).toBe(undefined)
-    expect((await ui.find({ type: 'Text', text: /^filed / }))?.text).toBe(`filed ${hhmm(start)}`)
-    expect((await ui.find({ type: 'Text', text: /^\d+ filed$/ }))?.text).toBe('1 filed')
+    expect(await ui.find({ type: 'Text', text: /^✓/ })).toBe(undefined)
+    expect((await ui.find({ type: 'Text', text: /^manifest updated / }))?.text).toBe(`manifest updated ${hhmm(start)}`)
+    expect((await ui.find({ type: 'Text', text: /^\d+ updates?$/ }))?.text).toBe('1 update')
     expect((await ui.find({ type: 'Text', text: /Port the billing job/ }))?.text).toBe('Port the billing job to the queue')
     expect((await ui.find({ type: 'Text', text: /^\d+ threads?$/ }))?.text).toBe('2 threads')
     await ui.unmount()
@@ -327,10 +328,10 @@ test('a filing lights the line with the manifest update, then the counter stays'
   // A second filing counts on, and lights the line again.
   await $.command.run({ command: 'judge', args: 'file' })
   const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
-  expect((await ui.find({ type: 'Text', text: /^\d+ filed$/ }))?.text).toBe('2 filed')
-  expect((await ui.find({ type: 'Text', text: /manifest updated/ }))?.text).toBe(`✓ manifest updated ${hhmm(clock.now())}`)
+  expect((await ui.find({ type: 'Text', text: /^\d+ updates?$/ }))?.text).toBe('2 updates')
+  expect((await ui.find({ type: 'Text', text: /^✓ manifest updated/ }))?.text).toBe(`✓ manifest updated ${hhmm(clock.now())}`)
   await clock.advance(8_001)
-  expect(await ui.find({ type: 'Text', text: /manifest updated/ })).toBe(undefined)
+  expect(await ui.find({ type: 'Text', text: /^✓/ })).toBe(undefined)
   await ui.unmount()
 })
 
@@ -351,7 +352,7 @@ test('a failed filing lights the line red for a moment', { options: { ...OPTIONS
 
   const ui = await $.ui.mount({ ...BAND, surface: 'desktop' })
   expect((await ui.find({ type: 'Text', text: /✗/ }))?.text).toBe('✗ filing failed')
-  expect(await ui.find({ type: 'Text', text: /^\d+ filed$/ })).toBe(undefined)
+  expect(await ui.find({ type: 'Text', text: /^\d+ updates?$/ })).toBe(undefined)
   await clock.advance(8_001)
   expect(await ui.find({ type: 'Text', text: /✗/ })).toBe(undefined)
   expect((await ui.find({ type: 'Text', text: /^filing failed$/ }))?.text).toBe('filing failed')
