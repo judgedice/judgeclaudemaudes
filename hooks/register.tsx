@@ -186,6 +186,8 @@ const live: {
   // was opened in its place.
   bandSeen: boolean
   paneOpen: boolean
+  // The mod's own version, from its manifest, for the pane and /judge.
+  version: string
 } = {
   storeKey: '',
   pingPendingUntil: 0,
@@ -211,6 +213,7 @@ const live: {
   isFiling: false,
   bandSeen: false,
   paneOpen: false,
+  version: '',
 }
 
 function minutes(ms: number) {
@@ -717,6 +720,24 @@ async function publish($: EngineInterface, entry: ThreadEntry) {
   throw new Error('the manifest branch kept moving under the commit; try again')
 }
 
+// What build this is, for the pane and /judge: the manifest's version when it carries one, else
+// the commit the install came from (the plugin's cache folder is named after it; plugin.json
+// leaves `version` out on purpose, so every commit reaches installed machines without a bump).
+async function readVersion($: EngineInterface) {
+  let version = ''
+  try {
+    const manifest = JSON.parse(await $.fs.read(`${$.plugin.root}/.claude-plugin/plugin.json`)) as { version?: string }
+    if (typeof manifest.version === 'string') version = manifest.version
+  } catch {
+    // No readable manifest: go by the folder.
+  }
+  if (!version) {
+    const leaf = $.plugin.root.split(/[\\/]/).filter(Boolean).pop() ?? ''
+    if (leaf && leaf !== $.plugin.name) version = /^[0-9a-f]{40}$/.test(leaf) ? leaf.slice(0, 7) : leaf
+  }
+  live.version = version
+}
+
 // Opens the pane that stands in for the band; says whether a surface placed it.
 async function openPane($: EngineInterface) {
   try {
@@ -1149,6 +1170,7 @@ export const register: Register = (on, options) => {
 
     live.storeKey = STORE_PREFIX + (await $.session.id())
     live.isFirstRequest = true
+    await readVersion($)
     const plan = (await $.store.get(PLAN_TTL_KEY)) as KeepWarmTtl | undefined
     if (plan && typeof plan.ms === 'number') live.planTtl = plan
 
@@ -1344,7 +1366,7 @@ export const register: Register = (on, options) => {
     const { value: filing = null } = await $.state.get(FILING)
     const { value: related = [] } = await $.state.get(RELATED)
     const lines = [
-      `Judge: manifest ${live.repo}, account "${accountLabel()}", ${live.fileThreads ? 'files this thread when its cache is about to expire' : 'files only on /judge file'}.`,
+      `Judge${live.version ? ` ${live.version}` : ''}: manifest ${live.repo}, account "${accountLabel()}", ${live.fileThreads ? 'files this thread when its cache is about to expire' : 'files only on /judge file'}.`,
       filing ? (filing.ok ? `Last filed ${clockTime(filing.at)} (${filing.by}) at ${filing.path}.` : `Last filing ${clockTime(filing.at)} failed: ${filing.error}`) : 'Not filed yet this session.',
     ]
     if (verdict) lines.push(`Verdict: ${verdict.summary}${verdict.project ? ` (project: ${verdict.project})` : ''}`)
@@ -1442,6 +1464,7 @@ export const register: Register = (on, options) => {
           {m.canToggle && <Button key="toggle" label={m.isOn ? 'Stop' : 'Keep warm'} onPress={() => setKeepWarm($, !m.isOn, 0)} />}
           {isJudging() && <Button key="file" label="File now" onPress={() => void judgeAndFile($, 'open')} />}
         </Box>
+        {live.version !== '' && <Text dimColor>{`${PLUGIN_NAME} ${live.version}`}</Text>}
       </Box>
     )
   })
