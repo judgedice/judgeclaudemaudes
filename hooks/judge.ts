@@ -221,6 +221,7 @@ export function bundlePrompt(live: readonly ThreadEntry[], previous: readonly Ma
   }))
   const system = [
     'You bundle Claude Code conversation threads into projects so their owner can see, per body of work, which threads are open and resume one instead of starting another.',
+    'These threads run in no git repository (those are bundled by repository already), so go by their titles, summaries, topics and directories.',
     'Rules:',
     '- Every thread id appears in exactly one project. Invent no ids.',
     '- Threads about the same repository, product, client or piece of work belong together, across accounts and machines.',
@@ -270,11 +271,24 @@ function fallbackProject(t: ThreadEntry) {
   return { name: base, description: `Threads in ${t.cwd || 'no directory'}` }
 }
 
+// A thread with a repository belongs to that repository's project: its name is the repository's,
+// its slug the owner's and the repository's, so two "app" repositories stay apart.
+export function repoProject(t: ThreadEntry) {
+  const repo = repoName(t.repo)
+  if (!repo) return null
+  return { name: repo.split('/').pop()!, slug: slugify(repo.replace('/', '-')), description: `Threads in ${repo}` }
+}
+
+// The threads the model is asked to bundle: those with no repository to go by.
+export function unplacedThreads(entries: readonly ThreadEntry[]) {
+  return entries.filter(t => repoProject(t) === null)
+}
+
 export function bundle(entries: readonly ThreadEntry[], assigned: Assignment, previous: readonly ManifestProject[], now: number): ManifestProject[] {
   const byId = new Map(entries.map(t => [t.sessionId, t]))
   const projects = new Map<string, { name: string; slug: string; description: string; repos: Set<string>; threads: ManifestThread[] }>()
-  const place = (name: string, description: string, t: ThreadEntry) => {
-    const slug = slugify(name)
+  const place = (name: string, description: string, t: ThreadEntry, slugOf = slugify(name)) => {
+    const slug = slugOf
     let p = projects.get(slug)
     if (!p) {
       p = { name, slug, description, repos: new Set(), threads: [] }
@@ -297,6 +311,13 @@ export function bundle(entries: readonly ThreadEntry[], assigned: Assignment, pr
     })
   }
   const seen = new Set<string>()
+  // Repositories first: every thread of one repository is one project, whatever the model says.
+  for (const t of entries) {
+    const r = repoProject(t)
+    if (!r) continue
+    seen.add(t.sessionId)
+    place(r.name, r.description, t, r.slug)
+  }
   for (const a of assigned) {
     for (const id of a.threadIds) {
       const t = byId.get(id)

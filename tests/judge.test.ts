@@ -8,7 +8,7 @@ const OPTIONS = { manifest_repo: 'me/claude-threads', account_label: 'work', git
 const BAND = {
   plugin: 'judge-keep-warm',
   component: 'AbovePrompt',
-  props: { hasSurvey: false, isWorking: false, maxRows: 10, bodyColumns: 120, scroll: { offset: 0, bodyRows: 10 }, view: {} },
+  props: { hasSurvey: false, isWorking: false, maxRows: 10, bodyColumns: 200, scroll: { offset: 0, bodyRows: 10 }, view: {} },
 } as const
 
 test('the judge reply parses into a verdict, and anything else does not', async () => {
@@ -231,8 +231,9 @@ test('with keep-warm off, the thread is filed locally when 5 minutes of the cach
   expect(filed.length).toBe(1)
   expect(filed[0]?.path).toBe('threads/work/sess-1.json')
   expect(filed[0]?.entry.filedBy).toBe('local')
-  expect(repo.modelCalls).toBe(1)
-  expect(filed[0]?.manifest.projects.map(p => p.name)).toEqual(['App billing'])
+  // Both threads run in me/app: bundled by repository, nothing for the model to place.
+  expect(repo.modelCalls).toBe(0)
+  expect(filed[0]?.manifest.projects.map(p => p.name)).toEqual(['app'])
   expect(filed[0]?.manifest.projects[0]?.threads.map(t => t.sessionId)).toEqual(['sess-1', 's-other'])
   expect(filed[0]?.md).toContain('> 2 open threads here. Resume one before opening another.')
   expect(repo.commits[0]?.message).toBe('judge: file Port the billing job to the queue (work); 2 threads in 1 projects')
@@ -302,6 +303,7 @@ test('a filing lights the line with the manifest update, then the counter stays'
     const ui = await $.ui.mount({ ...BAND, surface })
     expect((await ui.find({ type: 'Text', text: /Judgeiverse/ }))?.text).toBe('Judgeiverse')
     expect((await ui.find({ type: 'Text', text: /manifest updated/ }))?.text).toBe(`✓ manifest updated ${hhmm(start)}`)
+    expect((await ui.find({ type: 'Text', text: /Port the billing job/ }))?.text).toBe('Port the billing job to the queue')
     expect((await ui.find({ type: 'Text', text: /^\d+ threads?$/ }))?.text).toBe('2 threads')
     expect((await ui.find({ type: 'Text', text: /^\d+ projects?$/ }))?.text).toBe('1 project')
     expect((await ui.find({ type: 'Text', text: /^\d+ filed$/ }))?.text).toBe('1 filed')
@@ -317,6 +319,7 @@ test('a filing lights the line with the manifest update, then the counter stays'
     expect(await ui.find({ type: 'Text', text: /manifest updated/ })).toBe(undefined)
     expect((await ui.find({ type: 'Text', text: /^filed / }))?.text).toBe(`filed ${hhmm(start)}`)
     expect((await ui.find({ type: 'Text', text: /^\d+ filed$/ }))?.text).toBe('1 filed')
+    expect((await ui.find({ type: 'Text', text: /Port the billing job/ }))?.text).toBe('Port the billing job to the queue')
     expect((await ui.find({ type: 'Text', text: /^\d+ threads?$/ }))?.text).toBe('2 threads')
     await ui.unmount()
   }

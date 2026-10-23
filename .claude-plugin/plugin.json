@@ -1,7 +1,7 @@
 {
   "name": "judge-keep-warm",
   "displayName": "Judge Keep Warm",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "description": "Keeps a session's prompt cache warm and, when the cache is about to expire, files the thread into a GitHub manifest that it bundles into projects itself, through your own Claude Code connection, so you resume threads instead of opening new ones",
   "author": {
     "name": "Marvin Di Cesaro",

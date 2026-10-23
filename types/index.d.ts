@@ -130,6 +130,8 @@ declare module 'claude-code' {
       related: ManifestThread[]
       /** When the conversation last had a real turn (ms since epoch), pings left out; 0 = unknown. */
       lastActiveAt: number
+      /** The thread's title as the line shows it: the app's session title, else the first prompt's first line; '' = unknown. */
+      title: string
       /** Threads the manifest held as of this session's last filing (or its read at start); 0 = not known yet. */
       manifestThreads: number
       /** Projects the manifest held as of this session's last filing (or its read at start); 0 = not known yet. */

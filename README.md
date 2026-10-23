@@ -10,7 +10,7 @@ A fork of [Cache Keep-Warm](https://github.com/andreichiritescu/claude-code-cach
 - **Keep warm.** Click **Keep warm** or type `/keepwarm on`: 5 minutes before the cache would expire, a background read keeps it warm. A cold cache is never pinged.
 - **Judge.** With a manifest repository set, the keep-warm ping asks the model one question instead of "ok": what the thread is about, where it stands, its topics, its project, the next step, and whether it is done. The reply is written to `threads/<account>/<session id>.json` in the repository. The ping already reads the whole conversation from cache, so the judgment costs a few hundred output tokens on top.
 - **Without keep-warm,** the thread is still filed when its cache is about to expire, with a free local summary (the first prompt and the last answer).
-- **Bundling, done by the mod.** Before it pushes, the mod reads every thread the other accounts and machines filed, asks your own Claude Code connection (no API key) to bundle them all into projects, keeping the project names the manifest already has, and commits the thread entry together with `manifest.json` and `MANIFEST.md` in one commit. What lands in the repository is already classified. Threads go stale after 14 days; closed ones drop out after 30. Each row of `MANIFEST.md` carries the thread's `claude --resume` command.
+- **Bundling, done by the mod.** Before it pushes, the mod reads every thread the other accounts and machines filed and bundles them into projects: one project per git repository, named after it; threads with no repository are bundled by likeness through your own Claude Code connection (no API key), keeping the project names the manifest already has. Then it commits the thread entry together with `manifest.json` and `MANIFEST.md` in one commit. What lands in the repository is already classified. Threads go stale after 14 days; closed ones drop out after 30. Each row of `MANIFEST.md` carries the thread's `claude --resume` command.
 - **At session start,** the mod reads `manifest.json` and tells you which open threads already cover the repository or directory you are in. The line shows `N related threads`; `/judge threads` lists them with their resume commands.
 
 ## Reading the line
@@ -70,6 +70,10 @@ That is all. The first thread filed from any machine creates `threads/`, `manife
 | `/judge close` | Judge and file this thread as closed |
 | `/judge threads` | The open threads in the manifest that cover this repository or directory |
 | `/judge pane` | Open the Judgeiverse pane (it opens by itself where no line can be drawn) |
+
+## Reading the line
+
+`Judgeiverse` leads, then the circle and bar emptying with the cache's life, the time left, the thread's title (the app's session title, else your first prompt's first line), and the details: the next ping, what is cached, when the thread was last filed, related threads, and the counter (`12 threads · 4 projects · 3 filed`). The details that do not fit the window are left off from the right, so nothing runs under the button. For 8 seconds after a filing the label and a `✓ manifest updated HH:MM` segment turn green (red with `✗ filing failed`).
 
 ## Where the line shows
 

@@ -29,6 +29,7 @@ import {
   renderMarkdown,
   statusOf,
   threadPath,
+  unplacedThreads,
   titleFrom,
   toBase64,
 } from './judge'
@@ -119,6 +120,12 @@ const LABEL_COLOR = 'cyan'
 const PANE = 'judgeiverse'
 const PANE_TITLE = 'Judgeiverse keep warm'
 const PANE_DECIDE_MS = 6000
+// The thread's title in the line is cut to this many characters.
+const TITLE_SHOWN = 40
+const TITLE_MIN = 12
+// Room the toggle button and the gaps take, in columns, when fitting the details to the line.
+const BUTTON_COLUMNS = 14
+const FIT_MARGIN = 4
 // How long a filing's outcome stays lit on the line before it goes back to dim.
 const FLASH_MS = 8000
 
@@ -145,6 +152,7 @@ const MANIFEST_THREADS = { plugin: 'judge-keep-warm', key: 'manifestThreads' } a
 const MANIFEST_PROJECTS = { plugin: 'judge-keep-warm', key: 'manifestProjects' } as const
 const FILINGS = { plugin: 'judge-keep-warm', key: 'filings' } as const
 const FLASH_UNTIL = { plugin: 'judge-keep-warm', key: 'flashUntil' } as const
+const TITLE = { plugin: 'judge-keep-warm', key: 'title' } as const
 
 // The module's own variables start over on a reload; what must survive one is in $.state.
 const live: {
@@ -341,10 +349,22 @@ async function readTitle($: EngineInterface) {
   }
 }
 
+// The thread's title for the line: the app's session title, else the first prompt's first line.
+async function rememberTitle($: EngineInterface) {
+  let title = await readTitle($)
+  if (!title) {
+    const { value: sawResponse = false } = await $.state.get(SAW_RESPONSE)
+    title = sawResponse ? titleFrom(await $.session.messages(), await $.session.cwd()) : ''
+  }
+  const { value: was = '' } = await $.state.get(TITLE)
+  if (title && title !== was) await $.state.set(TITLE, title)
+}
+
 async function syncTitle($: EngineInterface) {
   const { value: isOn = false } = await $.state.get(KEEP_WARM)
   const { value: ttl = null } = await $.state.get(TTL)
   const wantsMark = live.titleMark && isOn && !(ttl && ttl.ms < KEEP_WARM_MIN_TTL_MS)
+  await rememberTitle($)
   try {
     const found = await $.tool.call({ tool: GET_SESSION_TOOL, session_id: 'self' })
     if ('deny' in found && found.deny) return
@@ -669,7 +689,7 @@ async function publish($: EngineInterface, entry: ThreadEntry) {
     entries.push(entry)
     const now = Date.parse(entry.filedAt)
     const kept = keptEntries(entries, now)
-    const assigned = await classify($, kept.filter(t => statusOf(t, now) !== 'closed'), previous)
+    const assigned = await classify($, unplacedThreads(kept.filter(t => statusOf(t, now) !== 'closed')), previous)
     const manifest: Manifest = { schema: 1, generatedAt: entry.filedAt, projects: bundle(kept, assigned, previous, now) }
     const files = [
       { path, text: entryJson(entry) },
@@ -744,6 +764,7 @@ async function fileThread($: EngineInterface, verdict: JudgeVerdict, by: ThreadE
     const { value: keepWarm = false } = await $.state.get(KEEP_WARM)
     const surfaces = await $.session.surfaces()
     const title = (await readTitle($)) || titleFrom(messages, cwd)
+    await $.state.set(TITLE, title)
     const expiresAt = last > 0 ? last + (ttl?.ms ?? HOUR_MS) : 0
     const entry: ThreadEntry = {
       schema: 1,
@@ -1005,6 +1026,25 @@ function parseStop(text: string, now: number) {
   return at.getTime() > now ? at.getTime() : at.getTime() + 24 * HOUR_MS
 }
 
+// The details that fit beside the fixed parts in `columns`, in order, so nothing runs under the
+// button: a surface's own clipping is not relied on. Each detail costs its text and a separator.
+function fitParts(parts: readonly string[], columns: number, fixed: number) {
+  let room = columns - fixed - FIT_MARGIN
+  const kept: string[] = []
+  for (const p of parts) {
+    const cost = p.length + DETAIL_GAP * 2 + 1
+    if (cost > room) {
+      // The first detail (the title) is cut to the room rather than dropped, when there is any.
+      const shorter = room - DETAIL_GAP * 2 - 1
+      if (kept.length === 0 && shorter >= TITLE_MIN) kept.push(`${p.slice(0, shorter - 1)}…`)
+      break
+    }
+    room -= cost
+    kept.push(p)
+  }
+  return kept
+}
+
 // Everything the band and the pane show, worked out once from the state: the same line on
 // either surface.
 async function lineModel($: EngineInterface) {
@@ -1080,7 +1120,9 @@ async function lineModel($: EngineInterface) {
 
   const canToggle = isOn || !ttl || canKeepWarm || ttl.reason === 'overage' || ttl.reason === 'observed'
   const flashText = filing ? (filing.ok ? `✓ manifest updated ${clockTime(filing.at)}` : '✗ filing failed') : ''
-  return { isFlash, flashColor, flashText, isGreen, circle, filled, main, expiresText, parts, canToggle, isOn }
+  const { value: fullTitle = '' } = await $.state.get(TITLE)
+  const title = fullTitle.length > TITLE_SHOWN ? `${fullTitle.slice(0, TITLE_SHOWN - 1)}…` : fullTitle
+  return { isFlash, flashColor, flashText, isGreen, circle, filled, main, expiresText, parts, canToggle, isOn, title }
 }
 
 export const register: Register = (on, options) => {
@@ -1216,6 +1258,7 @@ export const register: Register = (on, options) => {
           await $.state.set(PINGS, [])
           // A real turn: the thread is active, and its next expiry is a new one to file.
           await $.state.set(ACTIVE, await $.clock.now())
+          await rememberTitle($)
         }
       } else if (live.visiblePingAt > 0) {
         live.visiblePingAt = 0
@@ -1320,6 +1363,12 @@ export const register: Register = (on, options) => {
 
     const { Box, Button, Text } = $.ui.resolve(e)
     const m = await lineModel($)
+    // The title leads the details; the rest follows as far as the width allows.
+    const details = [...(m.title ? [m.title] : []), ...m.parts]
+    const fixed =
+      LABEL.length + DETAIL_GAP + 1 + DETAIL_GAP + BAR_CELLS + DETAIL_GAP + m.main.length + m.expiresText.length +
+      (m.isFlash ? DETAIL_GAP + m.flashText.length : 0) + (m.canToggle ? BUTTON_COLUMNS : 0)
+    const shown = fitParts(details, e.props.bodyColumns, fixed)
 
     return (
       <Box alignItems="center" flexWrap="nowrap">
@@ -1343,9 +1392,9 @@ export const register: Register = (on, options) => {
               <Text color={m.flashColor} bold>{m.flashText}</Text>
             </Box>
           )}
-          {m.parts.flatMap(p => [
+          {shown.flatMap(p => [
             <Box flexShrink={0}><Text dimColor>·</Text></Box>,
-            <Box flexShrink={0}><Text dimColor>{p}</Text></Box>,
+            <Box flexShrink={0}>{m.title !== '' && p === shown[0] && details[0] === m.title ? <Text>{p}</Text> : <Text dimColor>{p}</Text>}</Box>,
           ])}
         </Box>
         {m.canToggle && (
@@ -1384,6 +1433,7 @@ export const register: Register = (on, options) => {
             <Text dimColor>{m.expiresText}</Text>
           </Box>
         </Box>
+        {m.title !== '' && <Text>{m.title}</Text>}
         {m.isFlash && <Text color={m.flashColor} bold>{m.flashText}</Text>}
         {m.parts.map(p => (
           <Text dimColor>{p}</Text>
