@@ -44,7 +44,28 @@ claude plugin marketplace add https://github.com/judgedice/judgeclaudemaudes.git
 claude plugin install judge-keep-warm@judge-keep-warm
 ```
 
-Install it under the user scope on every account and machine you use Claude Code with. They all write to the same manifest repository; the account label tells their threads apart. In a cloud environment, put the same three commands in the environment's setup script (`claude plugin marketplace add https://github.com/judgedice/judgeclaudemaudes.git`, `claude plugin install judge-keep-warm@judge-keep-warm`, and `echo '{"account_label":"cloud"}' | claude plugin configure judge-keep-warm@judge-keep-warm --values-stdin`) and the token in the environment's variables as `JUDGE_KEEP_WARM_TOKEN`.
+Install it under the user scope on every account and machine you use Claude Code with. They all write to the same manifest repository; the account label tells their threads apart.
+
+Turn on auto-update for the `judge-keep-warm` marketplace on each machine: in `/plugin`, open **Marketplaces**, pick `judge-keep-warm` and enable auto-update. Claude Code then updates the mod when it starts. `plugin.json` carries no `version`, so every commit to `main` counts as a new version and reaches the machine without a release.
+
+In a cloud environment, put these commands in the environment's setup script, and the token in the environment's variables as `JUDGE_KEEP_WARM_TOKEN`. The Python step turns on auto-update: it sets `autoUpdate` on the marketplace's entry under `extraKnownMarketplaces` in user settings, which Claude Code reads when it starts.
+
+```bash
+claude plugin marketplace add https://github.com/judgedice/judgeclaudemaudes.git
+python3 - <<'PY'
+import json, os, pathlib
+p = pathlib.Path(os.environ.get('CLAUDE_CONFIG_DIR') or os.path.expanduser('~/.claude')) / 'settings.json'
+s = json.loads(p.read_text()) if p.exists() else {}
+entry = s.setdefault('extraKnownMarketplaces', {}).setdefault('judge-keep-warm', {'source': {'source': 'git', 'url': 'https://github.com/judgedice/judgeclaudemaudes.git'}})
+entry['autoUpdate'] = True
+p.parent.mkdir(parents=True, exist_ok=True)
+p.write_text(json.dumps(s, indent=2) + '\n')
+PY
+claude plugin install judge-keep-warm@judge-keep-warm
+echo '{"account_label":"cloud"}' | claude plugin configure judge-keep-warm@judge-keep-warm --values-stdin
+```
+
+A new container installs the latest commit anyway; auto-update covers a container you come back to, when Claude Code starts again there.
 
 ### The pane in a cloud session
 
