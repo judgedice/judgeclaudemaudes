@@ -69,6 +69,11 @@ That is all. The first thread filed from any machine creates `threads/`, `manife
 | `/judge file` | Judge and file this thread now |
 | `/judge close` | Judge and file this thread as closed |
 | `/judge threads` | The open threads in the manifest that cover this repository or directory |
+| `/judge pane` | Open the Judgeiverse pane (it opens by itself where no line can be drawn) |
+
+## Where the line shows
+
+In a terminal and in the desktop app's Code tab for local sessions, the line is drawn above the prompt. A cloud session's chat has no such slot, so there the mod opens a **Judgeiverse keep warm** pane a few seconds after start with the same content in rows: the circle, bar and countdown, the flash after a filing, each detail on its own row, and the Keep warm and File now buttons. `/judge pane` opens it anywhere panes exist.
 
 ## How filing is paced
 

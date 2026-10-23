@@ -176,6 +176,7 @@ function engine(on: Parameters<Parameters<typeof test>[1]>[1], startedAt: number
   on('tool.call', () => ({ result: {}, isError: true, text: 'no such tool' }))
   on('classic.SessionStart', () => ({}))
   on('ui.toast', () => ({ value: undefined }))
+  on('ui.open', () => ({ value: { isPlaced: false, reason: 'no surface places panes' } }))
   on('model.complete', () => {
     repo.modelCalls++
     return {
@@ -347,4 +348,66 @@ test('a failed filing lights the line red for a moment', { options: { ...OPTIONS
   expect(await ui.find({ type: 'Text', text: /✗/ })).toBe(undefined)
   expect((await ui.find({ type: 'Text', text: /^filing failed$/ }))?.text).toBe('filing failed')
   await ui.unmount()
+})
+
+const PANE = {
+  plugin: 'judge-keep-warm',
+  component: 'Pane',
+  requestId: 'judgeiverse',
+  props: { title: 'Judgeiverse keep warm', isFocused: false, bodyColumns: 60, placement: 'dock', scroll: { offset: 0, bodyRows: 20 }, view: {} },
+} as const
+
+test('the pane draws the same line in rows, on every surface', { options: OPTIONS }, async ($, on) => {
+  const start = 1_700_000_000_000
+  mock.clock(on, { now: start })
+  mock.store(on)
+  engine(on, start, { files: { 'README.md': 'hi' }, commits: [], modelCalls: 0 })
+  on('ui.open', () => ({ value: { isPlaced: true } }))
+
+  await $.session.start({ cwd: '/work/app', surface: 'desktop', isInteractive: true })
+
+  for (const surface of ['terminal', 'desktop'] as const) {
+    const ui = await $.ui.mount({ ...PANE, surface })
+    expect((await ui.find({ type: 'Text', text: /Judgeiverse/ }))?.text).toBe('Judgeiverse')
+    expect((await ui.find({ type: 'Text', text: /nothing cached yet/ }))?.text).toBe('nothing cached yet')
+    expect((await ui.find({ type: 'Button', text: /File now/ }))?.text).toBe('File now')
+    await ui.unmount()
+  }
+})
+
+test('the pane opens only where nothing has drawn the band', { options: OPTIONS }, async ($, on) => {
+  const start = 1_700_000_000_000
+  const clock = mock.clock(on, { now: start })
+  mock.store(on)
+  engine(on, start, { files: { 'README.md': 'hi' }, commits: [], modelCalls: 0 })
+  const opened: string[] = []
+  on('ui.open', (_, e) => {
+    opened.push(e.id)
+    return { value: { isPlaced: true } }
+  })
+
+  // A session whose surface draws the band: the band is asked for before the decision falls.
+  await $.session.start({ cwd: '/work/app', surface: 'desktop', isInteractive: true })
+  const ui = await $.ui.mount({ ...BAND, surface: 'desktop' })
+  await ui.unmount()
+  await clock.advance(7000)
+  expect(opened).toEqual([])
+})
+
+test('a session with no band gets the pane after a moment', { options: OPTIONS }, async ($, on) => {
+  const start = 1_700_000_000_000
+  const clock = mock.clock(on, { now: start })
+  mock.store(on)
+  engine(on, start, { files: { 'README.md': 'hi' }, commits: [], modelCalls: 0 })
+  const opened: string[] = []
+  on('ui.open', (_, e) => {
+    opened.push(e.id)
+    return { value: { isPlaced: true } }
+  })
+
+  await $.session.start({ cwd: '/work/app', surface: 'desktop', isInteractive: true })
+  await clock.advance(5000)
+  expect(opened).toEqual([])
+  await clock.advance(2000)
+  expect(opened).toEqual(['judgeiverse'])
 })

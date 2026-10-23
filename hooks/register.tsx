@@ -114,6 +114,11 @@ const PLUGIN_NAME = 'judge-keep-warm'
 // The line's name, first on it, so it reads as this mod's at a glance.
 const LABEL = 'Judgeiverse'
 const LABEL_COLOR = 'cyan'
+// Where no surface draws the band above the prompt (a cloud session's chat), the same content
+// goes into a pane, opened this long after start unless the band has been asked for by then.
+const PANE = 'judgeiverse'
+const PANE_TITLE = 'Judgeiverse keep warm'
+const PANE_DECIDE_MS = 6000
 // How long a filing's outcome stays lit on the line before it goes back to dim.
 const FLASH_MS = 8000
 
@@ -169,6 +174,10 @@ const live: {
   host: string
   user: string
   isFiling: boolean
+  // Whether a surface has asked for the band since this process started, and whether the pane
+  // was opened in its place.
+  bandSeen: boolean
+  paneOpen: boolean
 } = {
   storeKey: '',
   pingPendingUntil: 0,
@@ -192,6 +201,8 @@ const live: {
   host: '',
   user: '',
   isFiling: false,
+  bandSeen: false,
+  paneOpen: false,
 }
 
 function minutes(ms: number) {
@@ -686,6 +697,18 @@ async function publish($: EngineInterface, entry: ThreadEntry) {
   throw new Error('the manifest branch kept moving under the commit; try again')
 }
 
+// Opens the pane that stands in for the band; says whether a surface placed it.
+async function openPane($: EngineInterface) {
+  try {
+    const opened = await $.ui.open({ id: PANE, title: PANE_TITLE })
+    live.paneOpen = opened.isPlaced
+    return opened.isPlaced
+  } catch {
+    // A host with no panes at all: the line stays where it is.
+    return false
+  }
+}
+
 // Lights the line with the last filing's outcome for FLASH_MS, then lets it go dim again. The
 // timer clears the key (the write redraws the line); the tick clears one a reload left behind.
 async function flash($: EngineInterface) {
@@ -982,6 +1005,84 @@ function parseStop(text: string, now: number) {
   return at.getTime() > now ? at.getTime() : at.getTime() + 24 * HOUR_MS
 }
 
+// Everything the band and the pane show, worked out once from the state: the same line on
+// either surface.
+async function lineModel($: EngineInterface) {
+  const { value: last = 0 } = await $.state.get(LAST)
+  const { value: now = 0 } = await $.state.get(NOW)
+  const { value: isOn = false } = await $.state.get(KEEP_WARM)
+  const { value: stopAt = 0 } = await $.state.get(STOP_AT)
+  const { value: pings = [] } = await $.state.get(PINGS)
+  const { value: ttl = null } = await $.state.get(TTL)
+  const { value: contextTokens = 0 } = await $.state.get(CONTEXT)
+  const { value: isWaiting = false } = await $.state.get(WAITING)
+  const { value: shortAfter = 0 } = await $.state.get(SHORT_AFTER)
+  const { value: waits = false } = await $.state.get(WAITS)
+  const { value: sawResponse = false } = await $.state.get(SAW_RESPONSE)
+  const { value: pingError = '' } = await $.state.get(PING_ERROR)
+  const { value: nearlyFull = false } = await $.state.get(NEARLY_FULL)
+  const { value: filing = null } = await $.state.get(FILING)
+  const { value: related = [] } = await $.state.get(RELATED)
+  const { value: manifestThreads = 0 } = await $.state.get(MANIFEST_THREADS)
+  const { value: manifestProjects = 0 } = await $.state.get(MANIFEST_PROJECTS)
+  const { value: filings = 0 } = await $.state.get(FILINGS)
+  const { value: flashUntil = 0 } = await $.state.get(FLASH_UNTIL)
+  const isBlocked = (!sawResponse || waits) && nearlyFull
+  // Lit for FLASH_MS after a filing: green on a manifest update, red on a failure.
+  const isFlash = isJudging() && filing !== null && flashUntil > 0 && (await $.clock.now()) < flashUntil
+  const flashColor = filing?.ok ? 'green' : 'red'
+
+  const t = Math.max(now, last)
+  const ttlMs = ttl?.ms ?? HOUR_MS
+  const canKeepWarm = ttl !== null && ttl.ms >= KEEP_WARM_MIN_TTL_MS
+  const isGreen = isOn && canKeepWarm && !pingError && !isBlocked
+  const expiresAt = last + ttlMs
+  const remaining = expiresAt - t
+  const isWarm = last > 0 && remaining > 0
+  const filled = isWarm ? Math.max(1, Math.ceil((remaining / ttlMs) * BAR_CELLS)) : 0
+  const quarters = CIRCLE_BY_QUARTER.length
+  const circle = isWarm
+    ? CIRCLE_BY_QUARTER[Math.min(quarters, Math.max(1, Math.ceil((remaining / ttlMs) * quarters))) - 1]
+    : CIRCLE_COLD
+
+  const main = last === 0 ? 'nothing cached yet' : isWarm ? timeLeft(remaining) : `cold since ${clockTime(expiresAt)}`
+  const expiresText = isWarm ? ` (${clockTime(expiresAt)})` : ''
+  const parts: string[] = []
+  if (isWaiting && isWarm) parts.push('waiting for your answer')
+
+  if (ttl && !canKeepWarm) {
+    if (ttl.reason === 'observed') parts.push(`cache expired after ${minutes(shortAfter)} min, sooner than expected`, 'keep-warm paused')
+    else if (ttl.reason === 'overage') parts.push(`${cacheLength(ttl.ms)} cache while over your plan limit`, 'keep-warm paused')
+    else parts.push(`${cacheLength(ttl.ms)} cache (${ttl.reason === 'api' ? 'API key' : 'your settings'})`, 'keep-warm needs the 1-hour cache')
+  } else if (isOn) {
+    const lastPing = pings[pings.length - 1]
+    if (stopAt) parts.push(`keep-warm stops ${clockTime(stopAt)}`)
+    if (pingError) parts.push(`ping failed: ${pingError}`)
+    else if (!ttl) parts.push(WAITS_TEXT)
+    else if (isBlocked) parts.push(NEARLY_FULL_TEXT)
+    else if (isWarm) parts.push(`next ping ${clockTime(last + ttlMs - PING_LEAD_MS)}${sawResponse && !waits ? '' : SHOWS_IN_CHAT}`)
+    if (lastPing) parts.push(`${pings.length} ping${pings.length === 1 ? '' : 's'} ${lastPing.isHit ? '✓' : '✗'}`)
+  }
+
+  if (contextTokens > 0 && last > 0) {
+    if (!isWarm) parts.push(`your next message re-writes ${tokens(contextTokens)}`, ...(isGreen ? ['keep-warm restarts after it'] : []))
+    else if (!isGreen && remaining < EXPIRING_MS) parts.push(`after ${clockTime(expiresAt)} your next message re-writes ${tokens(contextTokens)}`)
+    else parts.push(`${tokens(contextTokens)} cached`)
+  }
+
+  // The judge's part: when the thread was last filed, or that filing failed; and how many
+  // other open threads the manifest holds for this project.
+  if (isJudging()) {
+    if (filing && !isFlash) parts.push(filing.ok ? `filed ${clockTime(filing.at)}` : 'filing failed')
+    if (related.length > 0) parts.push(`${related.length} related thread${related.length === 1 ? '' : 's'}`)
+    parts.push(...counter(manifestThreads, manifestProjects, filings))
+  }
+
+  const canToggle = isOn || !ttl || canKeepWarm || ttl.reason === 'overage' || ttl.reason === 'observed'
+  const flashText = filing ? (filing.ok ? `✓ manifest updated ${clockTime(filing.at)}` : '✗ filing failed') : ''
+  return { isFlash, flashColor, flashText, isGreen, circle, filled, main, expiresText, parts, canToggle, isOn }
+}
+
 export const register: Register = (on, options) => {
   live.titleMark = options[TITLE_MARK_OPTION] !== false
   live.repo = parseRepo(String(options[REPO_OPTION] ?? ''))
@@ -999,8 +1100,8 @@ export const register: Register = (on, options) => {
     })
     await $.command.register({
       name: JUDGE_COMMAND,
-      description: 'The thread manifest: status, file or close this thread, list the open threads of this project',
-      argumentHint: '[status | file | close | threads]',
+      description: 'The thread manifest: status, file or close this thread, list the open threads of this project, open the pane',
+      argumentHint: '[status | file | close | threads | pane]',
       immediate: true,
     })
 
@@ -1037,6 +1138,10 @@ export const register: Register = (on, options) => {
     $.clock.every(TITLE_SYNC_MS, () => void syncTitle($))
     // The related threads come from the network: never hold the start on them.
     void loadRelated($, false)
+    // Where nothing has drawn the band by now, the pane shows the line instead.
+    $.clock.after(PANE_DECIDE_MS, () => {
+      if (!live.bandSeen && !live.paneOpen) void openPane($)
+    })
 
     return next(e)
   })
@@ -1171,6 +1276,10 @@ export const register: Register = (on, options) => {
     if (!isJudging()) {
       return { text: `Judge: no manifest repository is set. Set "Manifest repository" to owner/repo in /config (plugin ${PLUGIN_NAME}); an empty private repository is enough.` }
     }
+    if (word === 'pane') {
+      const isPlaced = await openPane($)
+      return { text: isPlaced ? 'Judge: the Judgeiverse pane is open.' : 'Judge: no surface here places a pane; the line is drawn above the prompt where one exists.' }
+    }
     if (word === 'file' || word === 'close') {
       const verdict = await judgeAndFile($, word === 'close' ? 'closed' : 'open')
       const { value: filing = null } = await $.state.get(FILING)
@@ -1201,123 +1310,90 @@ export const register: Register = (on, options) => {
     const { value: manifestProjects = 0 } = await $.state.get(MANIFEST_PROJECTS)
     const { value: filings = 0 } = await $.state.get(FILINGS)
     lines.push(`Manifest: ${counter(manifestThreads, manifestProjects, filings).join(' · ') || 'not read yet'}.`)
-    lines.push('Commands: /judge file, /judge close, /judge threads')
+    lines.push('Commands: /judge file, /judge close, /judge threads, /judge pane')
     return { text: lines.join('\n') }
   })
 
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
     if (e.props.hasSurvey) return next(e)
+    live.bandSeen = true
 
     const { Box, Button, Text } = $.ui.resolve(e)
-    const { value: last = 0 } = await $.state.get(LAST)
-    const { value: now = 0 } = await $.state.get(NOW)
-    const { value: isOn = false } = await $.state.get(KEEP_WARM)
-    const { value: stopAt = 0 } = await $.state.get(STOP_AT)
-    const { value: pings = [] } = await $.state.get(PINGS)
-    const { value: ttl = null } = await $.state.get(TTL)
-    const { value: contextTokens = 0 } = await $.state.get(CONTEXT)
-    const { value: isWaiting = false } = await $.state.get(WAITING)
-    const { value: shortAfter = 0 } = await $.state.get(SHORT_AFTER)
-    const { value: waits = false } = await $.state.get(WAITS)
-    const { value: sawResponse = false } = await $.state.get(SAW_RESPONSE)
-    const { value: pingError = '' } = await $.state.get(PING_ERROR)
-    const { value: nearlyFull = false } = await $.state.get(NEARLY_FULL)
-    const { value: filing = null } = await $.state.get(FILING)
-    const { value: related = [] } = await $.state.get(RELATED)
-    const { value: manifestThreads = 0 } = await $.state.get(MANIFEST_THREADS)
-    const { value: manifestProjects = 0 } = await $.state.get(MANIFEST_PROJECTS)
-    const { value: filings = 0 } = await $.state.get(FILINGS)
-    const { value: flashUntil = 0 } = await $.state.get(FLASH_UNTIL)
-    const isBlocked = (!sawResponse || waits) && nearlyFull
-    // Lit for FLASH_MS after a filing: green on a manifest update, red on a failure.
-    const isFlash = isJudging() && filing !== null && flashUntil > 0 && (await $.clock.now()) < flashUntil
-    const flashColor = filing?.ok ? 'green' : 'red'
-
-    const t = Math.max(now, last)
-    const ttlMs = ttl?.ms ?? HOUR_MS
-    const canKeepWarm = ttl !== null && ttl.ms >= KEEP_WARM_MIN_TTL_MS
-    const isGreen = isOn && canKeepWarm && !pingError && !isBlocked
-    const expiresAt = last + ttlMs
-    const remaining = expiresAt - t
-    const isWarm = last > 0 && remaining > 0
-    const filled = isWarm ? Math.max(1, Math.ceil((remaining / ttlMs) * BAR_CELLS)) : 0
-    const quarters = CIRCLE_BY_QUARTER.length
-    const circle = isWarm
-      ? CIRCLE_BY_QUARTER[Math.min(quarters, Math.max(1, Math.ceil((remaining / ttlMs) * quarters))) - 1]
-      : CIRCLE_COLD
-
-    const main = last === 0 ? 'nothing cached yet' : isWarm ? timeLeft(remaining) : `cold since ${clockTime(expiresAt)}`
-    const expiresText = isWarm ? ` (${clockTime(expiresAt)})` : ''
-    const parts: string[] = []
-    if (isWaiting && isWarm) parts.push('waiting for your answer')
-
-    if (ttl && !canKeepWarm) {
-      if (ttl.reason === 'observed') parts.push(`cache expired after ${minutes(shortAfter)} min, sooner than expected`, 'keep-warm paused')
-      else if (ttl.reason === 'overage') parts.push(`${cacheLength(ttl.ms)} cache while over your plan limit`, 'keep-warm paused')
-      else parts.push(`${cacheLength(ttl.ms)} cache (${ttl.reason === 'api' ? 'API key' : 'your settings'})`, 'keep-warm needs the 1-hour cache')
-    } else if (isOn) {
-      const lastPing = pings[pings.length - 1]
-      if (stopAt) parts.push(`keep-warm stops ${clockTime(stopAt)}`)
-      if (pingError) parts.push(`ping failed: ${pingError}`)
-      else if (!ttl) parts.push(WAITS_TEXT)
-      else if (isBlocked) parts.push(NEARLY_FULL_TEXT)
-      else if (isWarm) parts.push(`next ping ${clockTime(last + ttlMs - PING_LEAD_MS)}${sawResponse && !waits ? '' : SHOWS_IN_CHAT}`)
-      if (lastPing) parts.push(`${pings.length} ping${pings.length === 1 ? '' : 's'} ${lastPing.isHit ? '✓' : '✗'}`)
-    }
-
-    if (contextTokens > 0 && last > 0) {
-      if (!isWarm) parts.push(`your next message re-writes ${tokens(contextTokens)}`, ...(isGreen ? ['keep-warm restarts after it'] : []))
-      else if (!isGreen && remaining < EXPIRING_MS) parts.push(`after ${clockTime(expiresAt)} your next message re-writes ${tokens(contextTokens)}`)
-      else parts.push(`${tokens(contextTokens)} cached`)
-    }
-
-    // The judge's part: when the thread was last filed, or that filing failed; and how many
-    // other open threads the manifest holds for this project.
-    if (isJudging()) {
-      if (filing && !isFlash) parts.push(filing.ok ? `filed ${clockTime(filing.at)}` : 'filing failed')
-      if (related.length > 0) parts.push(`${related.length} related thread${related.length === 1 ? '' : 's'}`)
-      parts.push(...counter(manifestThreads, manifestProjects, filings))
-    }
-
-    const canToggle = isOn || !ttl || canKeepWarm || ttl.reason === 'overage' || ttl.reason === 'observed'
+    const m = await lineModel($)
 
     return (
       <Box alignItems="center" flexWrap="nowrap">
         <Box flexGrow={1} flexShrink={1} minWidth={0} overflow="hidden" flexWrap="nowrap" alignItems="center" columnGap={DETAIL_GAP}>
           <Box flexShrink={0} width={LABEL.length}>
-            {isFlash ? <Text color={flashColor} bold>{LABEL}</Text> : <Text color={LABEL_COLOR}>{LABEL}</Text>}
+            {m.isFlash ? <Text color={m.flashColor} bold>{LABEL}</Text> : <Text color={LABEL_COLOR}>{LABEL}</Text>}
           </Box>
           <Box flexShrink={0}>
-            {isGreen ? <Text color="green" bold>{circle}</Text> : <Text dimColor>{circle}</Text>}
+            {m.isGreen ? <Text color="green" bold>{m.circle}</Text> : <Text dimColor>{m.circle}</Text>}
           </Box>
           <Box flexShrink={0}>
-            {isGreen ? <Text color="green">{BAR_FULL.repeat(filled)}</Text> : <Text dimColor>{BAR_FULL.repeat(filled)}</Text>}
-            <Text dimColor>{BAR_EMPTY.repeat(BAR_CELLS - filled)}</Text>
+            {m.isGreen ? <Text color="green">{BAR_FULL.repeat(m.filled)}</Text> : <Text dimColor>{BAR_FULL.repeat(m.filled)}</Text>}
+            <Text dimColor>{BAR_EMPTY.repeat(BAR_CELLS - m.filled)}</Text>
           </Box>
           <Box flexShrink={0}>
-            <Text bold>{main}</Text>
-            <Text dimColor>{expiresText}</Text>
+            <Text bold>{m.main}</Text>
+            <Text dimColor>{m.expiresText}</Text>
           </Box>
-          {isFlash && filing && (
+          {m.isFlash && (
             <Box flexShrink={0}>
-              <Text color={flashColor} bold>{filing.ok ? `✓ manifest updated ${clockTime(filing.at)}` : '✗ filing failed'}</Text>
+              <Text color={m.flashColor} bold>{m.flashText}</Text>
             </Box>
           )}
-          {parts.flatMap(p => [
+          {m.parts.flatMap(p => [
             <Box flexShrink={0}><Text dimColor>·</Text></Box>,
             <Box flexShrink={0}><Text dimColor>{p}</Text></Box>,
           ])}
         </Box>
-        {canToggle && (
+        {m.canToggle && (
           <Box flexShrink={0}>
             <Button
               key="toggle"
-              label={isOn ? 'Stop' : 'Keep warm'}
-              onPress={() => setKeepWarm($, !isOn, 0)}
+              label={m.isOn ? 'Stop' : 'Keep warm'}
+              onPress={() => setKeepWarm($, !m.isOn, 0)}
             />
           </Box>
         )}
       </Box>
     )
   })
+
+  // The same line as a pane, in rows, where no band is drawn (a cloud session's chat).
+  on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
+    const { Box, Button, Text } = $.ui.resolve(e)
+    const m = await lineModel($)
+
+    return (
+      <Box flexDirection="column" rowGap={0}>
+        <Box flexWrap="nowrap" alignItems="center" columnGap={DETAIL_GAP}>
+          <Box flexShrink={0}>
+            {m.isFlash ? <Text color={m.flashColor} bold>{LABEL}</Text> : <Text color={LABEL_COLOR} bold>{LABEL}</Text>}
+          </Box>
+          <Box flexShrink={0}>
+            {m.isGreen ? <Text color="green" bold>{m.circle}</Text> : <Text dimColor>{m.circle}</Text>}
+          </Box>
+          <Box flexShrink={0}>
+            {m.isGreen ? <Text color="green">{BAR_FULL.repeat(m.filled)}</Text> : <Text dimColor>{BAR_FULL.repeat(m.filled)}</Text>}
+            <Text dimColor>{BAR_EMPTY.repeat(BAR_CELLS - m.filled)}</Text>
+          </Box>
+          <Box flexShrink={0}>
+            <Text bold>{m.main}</Text>
+            <Text dimColor>{m.expiresText}</Text>
+          </Box>
+        </Box>
+        {m.isFlash && <Text color={m.flashColor} bold>{m.flashText}</Text>}
+        {m.parts.map(p => (
+          <Text dimColor>{p}</Text>
+        ))}
+        <Box columnGap={DETAIL_GAP}>
+          {m.canToggle && <Button key="toggle" label={m.isOn ? 'Stop' : 'Keep warm'} onPress={() => setKeepWarm($, !m.isOn, 0)} />}
+          {isJudging() && <Button key="file" label="File now" onPress={() => void judgeAndFile($, 'open')} />}
+        </Box>
+      </Box>
+    )
+  })
 }
+
