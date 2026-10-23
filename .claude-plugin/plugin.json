@@ -1,0 +1,61 @@
+{
+  "name": "judge-keep-warm",
+  "displayName": "Judge Keep Warm",
+  "version": "0.3.0",
+  "description": "Keeps a session's prompt cache warm and, when the cache is about to expire, files the thread into a GitHub manifest that it bundles into projects itself, through your own Claude Code connection, so you resume threads instead of opening new ones",
+  "author": {
+    "name": "Marvin Di Cesaro",
+    "url": "https://github.com/judgedice"
+  },
+  "license": "MIT",
+  "keywords": [
+    "prompt-cache",
+    "keep-warm",
+    "threads",
+    "manifest",
+    "github",
+    "mod"
+  ],
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "manifest_repo": {
+      "type": "string",
+      "title": "Manifest repository",
+      "description": "The GitHub repository that holds the thread manifest, as owner/repo; private, with the token given Contents read and write on it. Default: judgedice/judgeiverse. Empty: threads are not filed.",
+      "default": "judgedice/judgeiverse"
+    },
+    "account_label": {
+      "type": "string",
+      "title": "Account label",
+      "description": "How this Claude Code account is named in the manifest (work, personal, ...). Empty: the machine's user and host name.",
+      "default": ""
+    },
+    "github_token": {
+      "type": "string",
+      "title": "GitHub token",
+      "description": "A fine-grained token with Contents read and write on the manifest repository. Empty: the JUDGE_KEEP_WARM_TOKEN, GH_TOKEN or GITHUB_TOKEN variable, else the gh CLI's login.",
+      "default": "",
+      "sensitive": true
+    },
+    "file_threads": {
+      "type": "boolean",
+      "title": "File threads in the manifest",
+      "description": "When the cache is about to expire, write this thread's entry to the manifest repository. Off: only /judge file writes one.",
+      "default": true
+    },
+    "judge_model": {
+      "type": "string",
+      "title": "Judge model",
+      "description": "The model that bundles the threads into projects when a thread is filed: an alias (haiku, sonnet, opus) or a full id. Empty: this session's own model.",
+      "default": ""
+    },
+    "title_mark": {
+      "type": "boolean",
+      "title": "Mark the session title",
+      "description": "While keep-warm is on, put a green dot in front of the session's title in the desktop app's session list",
+      "default": true
+    }
+  },
+  "homepage": "https://github.com/judgedice/judgeclaudemaudes",
+  "repository": "https://github.com/judgedice/judgeclaudemaudes"
+}
