@@ -159,7 +159,8 @@ function fakeGithub(repo: Repo) {
   }
 }
 
-function engine(on: Parameters<Parameters<typeof test>[1]>[1], startedAt: number, repo: Repo) {
+// `panes`, when given, records every pane the mod opens and places it; without it, no surface places panes.
+function engine(on: Parameters<Parameters<typeof test>[1]>[1], startedAt: number, repo: Repo, panes?: string[]) {
   const github = fakeGithub(repo)
   mock.env(on, { HOSTNAME: 'mac.local', USER: 'me' })
   on('command.register', (_, e) => ({ value: { command: e.name } }))
@@ -176,7 +177,11 @@ function engine(on: Parameters<Parameters<typeof test>[1]>[1], startedAt: number
   on('tool.call', () => ({ result: {}, isError: true, text: 'no such tool' }))
   on('classic.SessionStart', () => ({}))
   on('ui.toast', () => ({ value: undefined }))
-  on('ui.open', () => ({ value: { isPlaced: false, reason: 'no surface places panes' } }))
+  on('ui.open', (_, e) => {
+    if (!panes) return { value: { isPlaced: false, reason: 'no surface places panes' } }
+    panes.push(e.id)
+    return { value: { isPlaced: true } }
+  })
   on('model.complete', () => {
     repo.modelCalls++
     return {
@@ -361,8 +366,7 @@ test('the pane draws the same line in rows, on every surface', { options: OPTION
   const start = 1_700_000_000_000
   mock.clock(on, { now: start })
   mock.store(on)
-  engine(on, start, { files: { 'README.md': 'hi' }, commits: [], modelCalls: 0 })
-  on('ui.open', () => ({ value: { isPlaced: true } }))
+  engine(on, start, { files: { 'README.md': 'hi' }, commits: [], modelCalls: 0 }, [])
 
   await $.session.start({ cwd: '/work/app', surface: 'desktop', isInteractive: true })
 
@@ -379,12 +383,8 @@ test('the pane opens only where nothing has drawn the band', { options: OPTIONS 
   const start = 1_700_000_000_000
   const clock = mock.clock(on, { now: start })
   mock.store(on)
-  engine(on, start, { files: { 'README.md': 'hi' }, commits: [], modelCalls: 0 })
   const opened: string[] = []
-  on('ui.open', (_, e) => {
-    opened.push(e.id)
-    return { value: { isPlaced: true } }
-  })
+  engine(on, start, { files: { 'README.md': 'hi' }, commits: [], modelCalls: 0 }, opened)
 
   // A session whose surface draws the band: the band is asked for before the decision falls.
   await $.session.start({ cwd: '/work/app', surface: 'desktop', isInteractive: true })
@@ -398,12 +398,8 @@ test('a session with no band gets the pane after a moment', { options: OPTIONS }
   const start = 1_700_000_000_000
   const clock = mock.clock(on, { now: start })
   mock.store(on)
-  engine(on, start, { files: { 'README.md': 'hi' }, commits: [], modelCalls: 0 })
   const opened: string[] = []
-  on('ui.open', (_, e) => {
-    opened.push(e.id)
-    return { value: { isPlaced: true } }
-  })
+  engine(on, start, { files: { 'README.md': 'hi' }, commits: [], modelCalls: 0 }, opened)
 
   await $.session.start({ cwd: '/work/app', surface: 'desktop', isInteractive: true })
   await clock.advance(5000)
