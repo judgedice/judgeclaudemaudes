@@ -22,7 +22,7 @@ import type {
   ProjectArchive,
   ThreadEntry,
 } from '../types'
-import { ago, mdCode, mdText, plural, projectMarkdown, summaryQuote, threadsReply } from './format'
+import { ago, mdCode, mdText, pickMark, plural, shortAgo, summaryQuote, threadSubtitle, threadsReply } from './format'
 import type { Assignment } from './judge'
 import { RELEASE } from './version'
 import {
@@ -40,6 +40,7 @@ import {
   bundle,
   bundlePrompt,
   buildOf,
+  deletedHow,
   describeThread,
   entryJson,
   findThreads,
@@ -164,6 +165,9 @@ const THREADS_BUTTON_COLUMNS = 12
 const PANE_FRESH_MS = 5 * 60_000
 // The thread titles the pane's buttons show are cut to this.
 const BUTTON_TITLE_MAX = 48
+// The pane's drawn cache bar, in CSS pixels, where the surface takes drawings.
+const BAR_PX = 120
+const BAR_PX_HIGH = 6
 const FILED_BY: Record<ThreadEntry['filedBy'], string> = { judge: 'by the judge', local: 'local summary', end: 'at the end' }
 const FIT_MARGIN = 4
 // How long a filing's outcome stays lit on the line before it goes back to dim.
@@ -203,6 +207,8 @@ const PANE_EDIT = { plugin: 'judge-keep-warm', key: 'paneEdit' } as const
 const PANE_NOTICE = { plugin: 'judge-keep-warm', key: 'paneNotice' } as const
 const IS_BUSY = { plugin: 'judge-keep-warm', key: 'isBusy' } as const
 const SELF_ARCHIVED = { plugin: 'judge-keep-warm', key: 'selfArchived' } as const
+const PANE_OPEN_THREAD = { plugin: 'judge-keep-warm', key: 'paneOpenThread' } as const
+const PANE_OPEN_ARCHIVE = { plugin: 'judge-keep-warm', key: 'paneOpenArchive' } as const
 
 // The module's own variables start over on a reload; what must survive one is in $.state.
 const live: {
@@ -1093,6 +1099,20 @@ async function readVersion($: EngineInterface) {
   live.version = version || 'dev'
 }
 
+// The pane's cache bar as a drawing: a rounded track, filled for the share of the cache's life
+// left, green while keep-warm holds it. Neutral grey reads on light and dark themes alike.
+function cacheBarSvg(ratio: number, isGreen: boolean) {
+  const r = BAR_PX_HIGH / 2
+  const fill = ratio > 0 ? Math.max(BAR_PX_HIGH, Math.round(BAR_PX * ratio)) : 0
+  const color = isGreen ? '#3fb950' : '#8b949e'
+  return [
+    `<svg xmlns="http://www.w3.org/2000/svg" width="${BAR_PX}" height="${BAR_PX_HIGH}" viewBox="0 0 ${BAR_PX} ${BAR_PX_HIGH}">`,
+    `<rect width="${BAR_PX}" height="${BAR_PX_HIGH}" rx="${r}" fill="#8b949e" fill-opacity="0.25"/>`,
+    fill > 0 ? `<rect width="${fill}" height="${BAR_PX_HIGH}" rx="${r}" fill="${color}"/>` : '',
+    '</svg>',
+  ].join('')
+}
+
 // The release as the line shows it, short: `v0.6.0`.
 function buildLabel() {
   return `v${RELEASE}`
@@ -1532,11 +1552,14 @@ async function lineModel($: EngineInterface) {
   }
 
   // The judge's part: when this session last updated the manifest, or that a filing failed; how
-  // many other open threads the manifest holds for this project; and the tally of updates.
+  // many other open threads the manifest holds for this project, and what it holds in all. The
+  // pane shows those two in its threads section, so its facts stop before them.
+  let factsEnd = parts.length
   if (isJudging()) {
     if (selfArchived) parts.push(selfArchived.reason === 'merged' ? 'merged into another thread' : 'taken out of the manifest')
     else if (!isFlash && filing && !filing.ok && filing.at >= updatedAt) parts.push('filing failed')
     else if (!isFlash && updatedAt > 0) parts.push(`manifest updated ${clockTime(updatedAt)}`)
+    factsEnd = parts.length
     if (related.length > 0) parts.push(`${related.length} related thread${related.length === 1 ? '' : 's'}`)
     parts.push(...counter(manifestThreads, manifestProjects, 0))
   }
@@ -1547,7 +1570,9 @@ async function lineModel($: EngineInterface) {
   const title = fullTitle.length > TITLE_SHOWN ? `${fullTitle.slice(0, TITLE_SHOWN - 1)}…` : fullTitle
   // The tally of this session's updates to the manifest: a fixed part of the line, not a detail.
   const tally = isJudging() && updates > 0 ? plural(updates, 'update') : ''
-  return { isFlash, flashColor, flashText, isGreen, circle, filled, main, expiresText, parts, canToggle, isOn, title, tally }
+  const facts = parts.slice(0, factsEnd)
+  const ratio = isWarm ? Math.min(1, remaining / ttlMs) : 0
+  return { isFlash, flashColor, flashText, isGreen, circle, filled, main, expiresText, parts, canToggle, isOn, title, tally, facts, ratio, fullTitle, isWarm }
 }
 
 export const register: Register = (on, options) => {
@@ -1887,12 +1912,63 @@ export const register: Register = (on, options) => {
     )
   })
 
-  // The same line as a pane, in rows, where no band is drawn (a cloud session's chat).
+  // The Judgeiverse pane, where no band is drawn (a cloud session's chat) or when asked for: a
+  // status card with the line in rows, then the threads, project by project, each thread one
+  // compact row that opens to its summary and resume command.
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
-    const { Box, Button, Markdown, Text } = $.ui.resolve(e)
+    const { Box, Button, Code, Markdown, Text } = $.ui.resolve(e)
     const m = await lineModel($)
-    // Below the line: this project's threads, or every project's, each project with its
-    // archived threads and an edit mode that merges or deletes the threads picked.
+    const flashKey = m.flashColor === 'red' ? 'error' : 'success'
+
+    // The cache's life: a drawn bar where the surface takes drawings, the line's cells on the terminal.
+    const bar =
+      e.surface === 'terminal' ? (
+        <Box flexShrink={0}>
+          {m.isGreen ? <Text color="green">{BAR_FULL.repeat(m.filled)}</Text> : <Text dimColor>{BAR_FULL.repeat(m.filled)}</Text>}
+          <Text dimColor>{BAR_EMPTY.repeat(BAR_CELLS - m.filled)}</Text>
+        </Box>
+      ) : (
+        (() => {
+          const { Svg } = $.ui.resolve(e)
+          return <Svg source={cacheBarSvg(m.ratio, m.isGreen)} alt={`${Math.round(m.ratio * 100)}% of the cache's life left`} width={BAR_PX} height={BAR_PX_HIGH} />
+        })()
+      )
+
+    const facts = [m.tally, ...m.facts].filter(p => p !== '')
+    const card = (
+      <Box flexDirection="column" rowGap="xs" paddingX="sm" paddingY="xs" borderStyle="round" borderColor={m.isFlash ? flashKey : 'subtle'}>
+        <Box justifyContent="space-between" alignItems="center" columnGap="sm">
+          <Text color={m.isFlash ? flashKey : LABEL_COLOR} weight="semibold">{LABEL}</Text>
+          <Text size="caption" dimColor>{buildLabel()}</Text>
+        </Box>
+        {m.fullTitle !== '' && (
+          <Text size="heading" weight="semibold" wrap="truncate-end">{m.fullTitle}</Text>
+        )}
+        <Box alignItems="center" columnGap="sm" flexWrap="wrap">
+          {bar}
+          <Text weight="medium" tabular color={m.isGreen ? 'success' : undefined}>{m.main}</Text>
+          {m.expiresText !== '' && <Text dimColor tabular>{`until ${m.expiresText.replace(/[ ()]/g, '')}`}</Text>}
+        </Box>
+        {m.isFlash && <Text color={flashKey} weight="semibold">{m.flashText}</Text>}
+        {facts.length > 0 && <Text size="footnote" dimColor>{facts.join(' · ')}</Text>}
+        <Box columnGap="sm" flexWrap="wrap">
+          {m.canToggle && <Button key="toggle" variant={m.isOn ? 'secondary' : 'primary'} label={m.isOn ? 'Stop' : 'Keep warm'} onPress={() => setKeepWarm($, !m.isOn, 0)} />}
+          {isJudging() && <Button key="file" label="File now" onPress={() => void judgeAndFile($, 'open')} />}
+        </Box>
+      </Box>
+    )
+    const threads = isJudging() ? await threadsSection() : null
+
+    return (
+      <Box flexDirection="column" rowGap="md">
+        {card}
+        {threads}
+        <Text size="caption" dimColor>{`${PLUGIN_NAME} ${buildDetail()}`}</Text>
+      </Box>
+    )
+
+    // This project's threads, or every project's: a header with the view and Refresh, then a
+    // section per project, its threads one row each, its archived ones folded away.
     async function threadsSection() {
       const { value: manifest = null } = await $.state.get(MANIFEST)
       const { value: readAt = 0 } = await $.state.get(MANIFEST_READ_AT)
@@ -1903,6 +1979,8 @@ export const register: Register = (on, options) => {
       const { value: isBusy = false } = await $.state.get(IS_BUSY)
       const { value: related = [] } = await $.state.get(RELATED)
       const { value: selfArchived = null } = await $.state.get(SELF_ARCHIVED)
+      const { value: openThread = null } = await $.state.get(PANE_OPEN_THREAD)
+      const { value: openArchive = null } = await $.state.get(PANE_OPEN_ARCHIVE)
       const { value: shownAt = 0 } = await $.state.get(NOW)
       const now = shownAt || (await $.clock.now())
       const selfId = await $.session.id()
@@ -1911,112 +1989,129 @@ export const register: Register = (on, options) => {
       const near = new Set([selfId, ...related.map(t => t.sessionId)])
       const mine = all.filter(p => p.threads.some(t => near.has(t.sessionId)))
       const shown = view === 'all' ? all : mine
-      const openIn = (ps: readonly ManifestProject[]) => ps.reduce((n, p) => n + p.threads.filter(t => t.status !== 'closed').length, 0)
+      const openOf = (p: ManifestProject) => p.threads.filter(t => t.status !== 'closed')
+      const openIn = (ps: readonly ManifestProject[]) => ps.reduce((n, p) => n + openOf(p).length, 0)
       const head = manifest
-        ? `${plural(openIn(all), 'open thread')} · ${plural(all.length, 'project')} · read ${clockTime(readAt)}`
+        ? `${plural(openIn(all), 'open thread')} in ${plural(all.length, 'project')} · read ${clockTime(readAt)}`
         : error
-          ? `manifest not read: ${error}`
-          : 'reading the manifest…'
+          ? `The manifest could not be read: ${error}`
+          : 'Reading the manifest…'
 
+      // One thread: its title and age, then who and where it stands; a press opens its summary,
+      // the threads merged into it, where it ran, and the command that resumes it.
+      const row = (t: ManifestThread) => {
+        const isOpen = openThread === t.sessionId
+        const isSelf = t.sessionId === selfId
+        const label = `${isOpen ? '▾' : '▸'} ${clipTitle(t.title)}`
+        return (
+          <Box flexDirection="column">
+            <Box justifyContent="space-between" alignItems="center" columnGap="sm">
+              <Box flexShrink={1} minWidth={0}>
+                <Button key={`open:${t.sessionId}`} plain onPress={() => $.state.set(PANE_OPEN_THREAD, isOpen ? null : t.sessionId)}>
+                  {isSelf ? [label, <Text color="suggestion">{'  this thread'}</Text>] : label}
+                </Button>
+              </Box>
+              <Text size="caption" dimColor tabular color={t.status === 'stale' ? 'warning' : undefined}>
+                {t.status === 'stale' ? `stale · ${shortAgo(t.lastActiveAt, now)}` : shortAgo(t.lastActiveAt, now)}
+              </Text>
+            </Box>
+            <Box paddingLeft="md">
+              <Text size="footnote" dimColor wrap="truncate-end">{`${t.account} · ${threadSubtitle(t)}`}</Text>
+            </Box>
+            {isOpen && (
+              <Box flexDirection="column" rowGap="xs" paddingLeft="md" paddingY="xs">
+                <Markdown text={summaryQuote(t.summary)} />
+                {(t.merged?.length ?? 0) > 0 && (
+                  <Text size="footnote" dimColor>{`Merged in: ${(t.merged ?? []).map(x => x.title).join(', ')}`}</Text>
+                )}
+                <Text size="caption" dimColor>{`${t.account} on ${t.host} · last active ${ago(t.lastActiveAt, now)}`}</Text>
+                <Code source={t.resume} language="bash" />
+              </Box>
+            )}
+          </Box>
+        )
+      }
+
+      // A project's edit mode: picks in order (the first kept on a merge), then the actions.
       const editor = (p: ManifestProject, open: readonly ManifestThread[]) => {
         const picked = edit?.slug === p.slug ? edit.picked : []
         const keep = open.find(t => t.sessionId === picked[0])
         return (
-          <Box flexDirection="column">
-            <Text dimColor>Pick the thread to keep first, then the ones to fold into it; or pick threads to delete.</Text>
-            {open.map(t => {
-              const at = picked.indexOf(t.sessionId)
-              return (
-                <Button key={`pick:${t.sessionId}`} plain onPress={() => update($, PANE_EDIT, current => togglePick(current ?? undefined, p.slug, t.sessionId))}>
-                  {`${at >= 0 ? `[${at + 1}]` : '[ ]'} ${clipTitle(t.title)}`} <Text dimColor>{`${t.account} · ${ago(t.lastActiveAt, now)}`}</Text>
-                </Button>
-              )
-            })}
-            <Box flexDirection="row" flexWrap="wrap" columnGap={1}>
+          <Box flexDirection="column" rowGap="xs" paddingLeft="sm">
+            <Text size="caption" dimColor>Pick threads. A merge keeps the first one you pick and folds the rest into it.</Text>
+            {open.map(t => (
+              <Button key={`pick:${t.sessionId}`} plain onPress={() => update($, PANE_EDIT, current => togglePick(current ?? undefined, p.slug, t.sessionId))}>
+                {`${pickMark(picked.indexOf(t.sessionId))} ${clipTitle(t.title)}`}
+                <Text dimColor>{`  ${t.account} · ${shortAgo(t.lastActiveAt, now)}`}</Text>
+              </Button>
+            ))}
+            <Box columnGap="sm" flexWrap="wrap" paddingTop="xs">
               {picked.length >= 2 && keep && (
                 <Button key={`merge:${p.slug}`} variant="primary" label={`Merge ${picked.length - 1} into “${clipTitle(keep.title)}”`} onPress={() => paneAction($, 'merge')} />
               )}
               {picked.length >= 1 && <Button key={`delete:${p.slug}`} label={`Delete ${picked.length}`} onPress={() => paneAction($, 'delete')} />}
-              <Button key={`cancel:${p.slug}`} label="Cancel" onPress={() => $.state.set(PANE_EDIT, null)} />
+              <Button key={`cancel:${p.slug}`} plain label="Cancel" onPress={() => $.state.set(PANE_EDIT, null)} />
             </Box>
           </Box>
         )
       }
 
       const section = (p: ManifestProject) => {
-        const open = p.threads.filter(t => t.status !== 'closed')
+        const open = openOf(p)
         const isEditing = edit?.slug === p.slug
-        const counts = [plural(open.length, 'open thread'), ...(p.archived?.length ? [`${p.archived.length} archived`] : [])].join(' · ')
+        const archived = p.archived ?? []
+        const isArchiveOpen = openArchive === p.slug
         return (
-          <Box flexDirection="column">
-            <Box flexDirection="row" flexWrap="wrap" columnGap={1} alignItems="center">
-              <Text bold>{p.name}</Text>
-              <Text dimColor>{counts}</Text>
+          <Box flexDirection="column" rowGap="xs">
+            <Box justifyContent="space-between" alignItems="center" columnGap="sm">
+              <Box columnGap="sm" alignItems="center" flexShrink={1} minWidth={0}>
+                <Text weight="semibold" wrap="truncate-end">{p.name}</Text>
+                <Text size="caption" dimColor>{String(open.length)}</Text>
+              </Box>
               {!isEditing && open.length > 0 && (
-                <Button key={`edit:${p.slug}`} label="Merge or delete" onPress={() => $.state.set(PANE_EDIT, { slug: p.slug, picked: [] })} />
+                <Button key={`edit:${p.slug}`} plain label="Merge / delete" onPress={() => $.state.set(PANE_EDIT, { slug: p.slug, picked: [] })} />
               )}
             </Box>
-            {isEditing ? editor(p, open) : <Markdown text={projectMarkdown(p, now, selfId, view === 'project')} />}
+            {p.description !== '' && <Text size="caption" dimColor wrap="truncate-end">{p.description}</Text>}
+            {isEditing ? editor(p, open) : open.length > 0 ? open.map(row) : <Text size="footnote" dimColor>No open thread.</Text>}
+            {archived.length > 0 && (
+              <Button key={`archived:${p.slug}`} plain label={`${isArchiveOpen ? '▾' : '▸'} ${archived.length} archived`} onPress={() => $.state.set(PANE_OPEN_ARCHIVE, isArchiveOpen ? null : p.slug)} />
+            )}
+            {isArchiveOpen &&
+              archived.map(a => (
+                <Box flexDirection="column" paddingLeft="md">
+                  <Text size="footnote" dimColor strikethrough wrap="truncate-end">{a.title}</Text>
+                  <Text size="caption" dimColor wrap="truncate-end">
+                    {`${a.reason === 'merged' ? `merged into ${p.threads.find(t => t.sessionId === a.into)?.title ?? a.into?.slice(0, 8) ?? '?'}` : deletedHow(a.by)} · ${a.archivedAt.slice(0, 10)} · ${a.brief}`}
+                  </Text>
+                </Box>
+              ))}
           </Box>
         )
       }
 
       return (
-        <Box flexDirection="column" rowGap={1} marginTop={1}>
-          <Box flexDirection="row" flexWrap="wrap" columnGap={1} alignItems="center">
-            <Text bold>Threads</Text>
-            <Text dimColor>{head}</Text>
+        <Box flexDirection="column" rowGap="sm">
+          <Box justifyContent="space-between" alignItems="center" columnGap="sm">
+            <Text size="heading" weight="semibold">Threads</Text>
+            <Button key="refresh" plain label={isBusy ? 'Working…' : '↻ Refresh'} onPress={() => refreshPane($)} />
           </Box>
-          <Box flexDirection="row" flexWrap="wrap" columnGap={1}>
-            <Button key="view-project" label={`This project (${openIn(mine)})`} variant={view === 'project' ? 'primary' : 'secondary'} onPress={() => $.state.set(PANE_VIEW, 'project')} />
-            <Button key="view-all" label={`All (${openIn(all)})`} variant={view === 'all' ? 'primary' : 'secondary'} onPress={() => $.state.set(PANE_VIEW, 'all')} />
-            <Button key="refresh" label={isBusy ? 'Working…' : 'Refresh'} onPress={() => refreshPane($)} />
+          <Text size="caption" dimColor color={error && !manifest ? 'warning' : undefined}>{head}</Text>
+          <Box columnGap="sm" flexWrap="wrap">
+            <Button key="view-project" variant={view === 'project' ? 'primary' : 'secondary'} label={`This project · ${openIn(mine)}`} onPress={() => $.state.set(PANE_VIEW, 'project')} />
+            <Button key="view-all" variant={view === 'all' ? 'primary' : 'secondary'} label={`All · ${openIn(all)}`} onPress={() => $.state.set(PANE_VIEW, 'all')} />
           </Box>
-          {notice !== '' && <Text dimColor>{notice}</Text>}
-          {selfArchived && <Text color="yellow">{`This thread was ${selfArchivedText(selfArchived, manifest)}.`}</Text>}
+          {notice !== '' && <Text size="footnote" dimColor>{notice}</Text>}
+          {selfArchived && <Text size="footnote" color="warning">{`This thread was ${selfArchivedText(selfArchived, manifest)}.`}</Text>}
           {manifest && shown.length === 0 && (
-            <Markdown text={view === 'project' ? '*No thread in the manifest covers this repository or directory yet. **All** lists every project.*' : '*The manifest lists no project yet.*'} />
+            <Text size="footnote" dimColor>
+              {view === 'project' ? 'No thread in the manifest covers this repository or directory yet. All lists every project.' : 'The manifest lists no project yet.'}
+            </Text>
           )}
           {shown.map(section)}
         </Box>
       )
     }
-
-    const threads = isJudging() ? await threadsSection() : null
-
-    return (
-      <Box flexDirection="column" rowGap={0}>
-        <Box flexWrap="nowrap" alignItems="center" columnGap={DETAIL_GAP}>
-          <Box flexShrink={0}>
-            {m.isFlash ? <Text color={m.flashColor} bold>{LABEL}</Text> : <Text color={LABEL_COLOR} bold>{LABEL}</Text>}
-          </Box>
-          <Box flexShrink={0}>
-            {m.isGreen ? <Text color="green" bold>{m.circle}</Text> : <Text dimColor>{m.circle}</Text>}
-          </Box>
-          <Box flexShrink={0}>
-            {m.isGreen ? <Text color="green">{BAR_FULL.repeat(m.filled)}</Text> : <Text dimColor>{BAR_FULL.repeat(m.filled)}</Text>}
-            <Text dimColor>{BAR_EMPTY.repeat(BAR_CELLS - m.filled)}</Text>
-          </Box>
-          <Box flexShrink={0}>
-            <Text bold>{m.main}</Text>
-            <Text dimColor>{m.expiresText}</Text>
-          </Box>
-        </Box>
-        {m.title !== '' && <Text>{m.title}</Text>}
-        {m.isFlash && <Text color={m.flashColor} bold>{m.flashText}</Text>}
-        {m.tally !== '' && <Text dimColor>{m.tally}</Text>}
-        {m.parts.map(p => (
-          <Text dimColor>{p}</Text>
-        ))}
-        <Box columnGap={DETAIL_GAP}>
-          {m.canToggle && <Button key="toggle" label={m.isOn ? 'Stop' : 'Keep warm'} onPress={() => setKeepWarm($, !m.isOn, 0)} />}
-          {isJudging() && <Button key="file" label="File now" onPress={() => void judgeAndFile($, 'open')} />}
-        </Box>
-        <Text dimColor>{`${PLUGIN_NAME} ${buildDetail()}`}</Text>
-        {threads}
-      </Box>
-    )
-
   })
 }
 

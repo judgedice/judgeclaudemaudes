@@ -202,6 +202,10 @@ declare module 'claude-code' {
       isBusy: boolean
       /** This thread's own record when a merge or a deletion took it out of the manifest; null = listed. */
       selfArchived: ArchivedThread | null
+      /** The thread whose row the pane shows open (summary, resume command); null = none. */
+      paneOpenThread: string | null
+      /** The project whose archived threads the pane shows; null = none. */
+      paneOpenArchive: string | null
     }
   }
 }

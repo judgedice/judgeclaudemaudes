@@ -7,6 +7,7 @@ import type { Manifest, ManifestThread, ProjectArchive } from '../types'
 
 const OPTIONS = { manifest_repo: 'me/claude-threads', account_label: 'work', github_token: 'ghp_test', file_threads: true }
 const START = 1_700_000_000_000
+const PLUGIN_FOOTER = 'judge-keep-warm '
 
 const KEEP = 'aaaa1111-0000-4000-8000-000000000001'
 const DROP = 'bbbb2222-0000-4000-8000-000000000002'
@@ -294,7 +295,7 @@ test('the deletion hook does nothing when this session is not among the transcri
   expect(repo.commits.length).toBe(0)
 })
 
-test('the pane lists the threads on every surface, and merges the ones picked', { options: OPTIONS }, async ($, on) => {
+test('the pane draws a status card and compact thread rows on every surface, and merges the ones picked', { options: OPTIONS }, async ($, on) => {
   const clock = mock.clock(on, { now: START })
   mock.store(on)
   const { repo } = engine(on, repoFiles(THREADS.slice(0, 2)))
@@ -305,22 +306,33 @@ test('the pane lists the threads on every surface, and merges the ones picked', 
   for (const surface of ['terminal', 'desktop', 'vscode', 'mobile'] as const) {
     const ui = await $.ui.mount({ ...PANE, surface })
     expect((await ui.find({ type: 'Text', text: /^Judgeiverse$/ }))?.text).toBe('Judgeiverse')
-    expect((await ui.find({ type: 'Text', text: /^judge-keep-warm / }))?.text).toBe(`judge-keep-warm v${RELEASE} · 9.9.9`)
-    expect((await ui.find({ type: 'Text', text: /open threads? ·/ }))?.text).toContain('2 open threads · 1 project · read ')
-    expect((await ui.find({ key: 'view-project' }))?.props['label']).toBe('This project (2)')
-    const list = await ui.find({ type: 'Markdown' })
-    expect(list?.text).toContain('**Keep me** · home on pc')
-    expect(list?.text).toContain('> Porting the queue tests to the new runner. Two suites left.')
-    expect(await ui.find({ key: 'edit:me-app' })).toBeDefined()
+    expect((await ui.find({ type: 'Text', text: /^v\d/ }))?.text).toBe(`v${RELEASE}`)
+    // The cache bar is a drawing where the surface takes one, cells on the terminal.
+    expect((await ui.find({ type: 'Svg' })) === undefined).toBe(surface === 'terminal')
+    expect((await ui.find({ type: 'Text', text: /open threads? in/ }))?.text).toContain('2 open threads in 1 project · read ')
+    expect((await ui.find({ key: 'view-project' }))?.props['label']).toBe('This project · 2')
+    expect((await ui.find({ key: `open:${KEEP}` }))?.text).toBe('▸ Keep me')
+    // The second line says where the thread stands, not its title again.
+    expect((await ui.find({ type: 'Text', text: /^home · Retries/ }))?.text).toBe('home · Retries are capped at five.')
+    expect((await ui.find({ type: 'Text', text: /^home · Porting/ }))?.text).toBe('home · Porting the queue tests to the new runner.')
+    expect((await ui.find({ type: 'Text', text: new RegExp(`^${PLUGIN_FOOTER}`) }))?.text).toBe(`judge-keep-warm v${RELEASE} · 9.9.9`)
     await ui.unmount()
   }
 
   const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  // A row opens to its summary and its resume command.
+  expect(await ui.find({ type: 'Code' })).toBe(undefined)
+  await ui.press({ key: `open:${KEEP}` })
+  expect((await ui.find({ key: `open:${KEEP}` }))?.text).toBe('▾ Keep me')
+  expect((await ui.find({ type: 'Code' }))?.text).toBe(`claude --resume ${KEEP}`)
+  expect((await ui.find({ type: 'Markdown' }))?.text).toContain('> **Started with:** Fix the queue retries')
+
   await ui.press({ key: 'edit:me-app' })
   await ui.press({ key: `pick:${KEEP}` })
   expect(await ui.find({ key: 'merge:me-app' })).toBe(undefined)
   await ui.press({ key: `pick:${DROP}` })
-  expect((await ui.find({ key: `pick:${KEEP}` }))?.text).toContain('[1] Keep me')
+  expect((await ui.find({ key: `pick:${KEEP}` }))?.text).toContain('① Keep me')
+  expect((await ui.find({ key: `pick:${DROP}` }))?.text).toContain('② Fold me')
   expect((await ui.find({ key: 'merge:me-app' }))?.props['label']).toBe('Merge 1 into “Keep me”')
   expect((await ui.find({ key: 'delete:me-app' }))?.props['label']).toBe('Delete 2')
   await ui.press({ key: 'merge:me-app' })
@@ -329,9 +341,12 @@ test('the pane lists the threads on every surface, and merges the ones picked', 
   expect(archiveOf(repo, 'me-app').threads.map(a => [a.sessionId, a.reason, a.into])).toEqual([[DROP, 'merged', KEEP]])
   expect((await ui.find({ type: 'Text', text: /^Merged / }))?.text).toBe('Merged 1 thread into “Keep me”; the one-line summaries are in the project\'s sub-manifest.')
   expect(await ui.find({ key: 'merge:me-app' })).toBe(undefined)
-  const list = await ui.find({ type: 'Markdown' })
-  expect(list?.text).toContain('*Merged in:* Fold me')
-  expect(list?.text).toContain('**Archived** (1)')
+  expect((await ui.find({ type: 'Text', text: /^Merged in:/ }))?.text).toBe('Merged in: Fold me')
+  // The archived threads fold away under the project until opened.
+  expect(await ui.find({ type: 'Text', text: /^Fold me$/ })).toBe(undefined)
+  await ui.press({ key: 'archived:me-app' })
+  expect((await ui.find({ type: 'Text', text: /^Fold me$/ }))?.props['strikethrough']).toBe(true)
+  expect((await ui.find({ type: 'Text', text: /^merged into Keep me/ }))?.text).toContain('Porting the queue tests to the new runner.')
   await ui.unmount()
 
   // The band counts the merge as an update to the manifest.
@@ -449,4 +464,20 @@ test('Threads opens the pane where one can, and runs nothing in the chat', { opt
   expect(opened).toEqual(['judgeiverse'])
   expect(runs).toEqual([])
   expect(toasts.some(t => t.includes('no pane can open'))).toBe(false)
+})
+
+test('this session\'s own row is marked in the pane', { options: OPTIONS }, async ($, on) => {
+  const clock = mock.clock(on, { now: START })
+  mock.store(on)
+  const own: Thread = { id: 'sess-1', account: 'work', host: 'mac', title: 'Port the billing job', summary: 'Porting the billing job to the queue. The worker is next.' }
+  engine(on, repoFiles([THREADS[0]!, own]))
+
+  await $.session.start({ cwd: '/work/app', surface: 'desktop', isInteractive: true })
+  await clock.advance(1)
+  for (const surface of ['terminal', 'desktop', 'mobile'] as const) {
+    const ui = await $.ui.mount({ ...PANE, surface })
+    expect((await ui.find({ key: 'open:sess-1' }))?.text).toBe('▸ Port the billing job  this thread')
+    expect((await ui.find({ type: 'Text', text: /^work · Porting/ }))?.text).toBe('work · Porting the billing job to the queue.')
+    await ui.unmount()
+  }
 })
