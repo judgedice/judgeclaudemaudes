@@ -24,6 +24,7 @@ import type {
 } from '../types'
 import { ago, mdCode, mdText, plural, projectMarkdown, summaryQuote, threadsReply } from './format'
 import type { Assignment } from './judge'
+import { RELEASE } from './version'
 import {
   ARCHIVE_DIR,
   ENTRY_GONE,
@@ -38,6 +39,7 @@ import {
   attachArchives,
   bundle,
   bundlePrompt,
+  buildOf,
   describeThread,
   entryJson,
   findThreads,
@@ -1086,14 +1088,32 @@ async function readVersion($: EngineInterface) {
   }
   if (!version) {
     const leaf = $.plugin.root.split(/[\\/]/).filter(Boolean).pop() ?? ''
-    if (leaf && leaf !== $.plugin.name) version = /^[0-9a-f]{40}$/.test(leaf) ? leaf.slice(0, 7) : leaf
+    version = buildOf(leaf, $.plugin.name)
   }
   live.version = version || 'dev'
 }
 
-// The build as the line shows it: `v0.4.0` for a release, the commit or `dev` as it is.
+// The release as the line shows it, short: `v0.6.0`.
 function buildLabel() {
-  return /^\d+\.\d+/.test(live.version) ? `v${live.version}` : live.version
+  return `v${RELEASE}`
+}
+
+// The release and the build it came from, for the pane and /judge: `v0.6.0 · 806d383`.
+function buildDetail() {
+  const build = live.version && live.version !== RELEASE ? live.version : ''
+  return build ? `${buildLabel()} · ${build}` : buildLabel()
+}
+
+// The Threads button: the pane where a surface places one; else the list goes into the chat,
+// as /judge threads prints it, so the press always shows the threads.
+async function showThreads($: EngineInterface) {
+  if (await showPane($)) return
+  $.ui.toast('Judge: no pane can open here, so the threads are listed in the chat.')
+  try {
+    await $.command.run({ command: JUDGE_COMMAND, args: 'threads' })
+  } catch (err) {
+    $.ui.log(`judge: listing the threads in the chat failed: ${err instanceof Error ? err.message : String(err)}`, { to: 'debug' })
+  }
 }
 
 // Opens the pane that stands in for the band; says whether a surface placed it.
@@ -1517,7 +1537,6 @@ async function lineModel($: EngineInterface) {
     if (selfArchived) parts.push(selfArchived.reason === 'merged' ? 'merged into another thread' : 'taken out of the manifest')
     else if (!isFlash && filing && !filing.ok && filing.at >= updatedAt) parts.push('filing failed')
     else if (!isFlash && updatedAt > 0) parts.push(`manifest updated ${clockTime(updatedAt)}`)
-    if (updates > 0) parts.push(plural(updates, 'update'))
     if (related.length > 0) parts.push(`${related.length} related thread${related.length === 1 ? '' : 's'}`)
     parts.push(...counter(manifestThreads, manifestProjects, 0))
   }
@@ -1526,7 +1545,9 @@ async function lineModel($: EngineInterface) {
   const flashText = flashFailed ? '✗ filing failed' : `✓ manifest updated ${clockTime(updatedAt)}`
   const { value: fullTitle = '' } = await $.state.get(TITLE)
   const title = fullTitle.length > TITLE_SHOWN ? `${fullTitle.slice(0, TITLE_SHOWN - 1)}…` : fullTitle
-  return { isFlash, flashColor, flashText, isGreen, circle, filled, main, expiresText, parts, canToggle, isOn, title }
+  // The tally of this session's updates to the manifest: a fixed part of the line, not a detail.
+  const tally = isJudging() && updates > 0 ? plural(updates, 'update') : ''
+  return { isFlash, flashColor, flashText, isGreen, circle, filled, main, expiresText, parts, canToggle, isOn, title, tally }
 }
 
 export const register: Register = (on, options) => {
@@ -1785,7 +1806,7 @@ export const register: Register = (on, options) => {
     const { value: updates = 0 } = await $.state.get(UPDATES)
     const { value: updatedAt = 0 } = await $.state.get(UPDATED_AT)
     const lines = [
-      `**Judge** ${mdText(buildLabel())} · manifest ${mdCode(live.repo)} · account ${mdCode(accountLabel())}`,
+      `**Judge** ${mdText(buildDetail())} · manifest ${mdCode(live.repo)} · account ${mdCode(accountLabel())}`,
       '',
       `- **Filing:** ${live.fileThreads ? "when this thread's cache is about to expire" : 'only on `/judge file`'}`,
       `- **Last filed:** ${filing ? (filing.ok ? `${clockTime(filing.at)}, ${FILED_BY[filing.by]}, at ${mdCode(filing.path)}` : `${clockTime(filing.at)}, failed: ${mdText(filing.error)}`) : 'not yet this session'}`,
@@ -1809,7 +1830,8 @@ export const register: Register = (on, options) => {
     const build = buildLabel()
     const fixed =
       LABEL.length + DETAIL_GAP + build.length + DETAIL_GAP + 1 + DETAIL_GAP + BAR_CELLS + DETAIL_GAP + m.main.length + m.expiresText.length +
-      (m.isFlash ? DETAIL_GAP + m.flashText.length : 0) + (m.canToggle ? BUTTON_COLUMNS : 0) + (isJudging() ? THREADS_BUTTON_COLUMNS : 0)
+      (m.isFlash ? DETAIL_GAP + m.flashText.length : 0) + (m.tally ? DETAIL_GAP + m.tally.length : 0) +
+      (m.canToggle ? BUTTON_COLUMNS : 0) + (isJudging() ? THREADS_BUTTON_COLUMNS : 0)
     const shown = fitParts(details, e.props.bodyColumns, fixed)
 
     return (
@@ -1837,6 +1859,11 @@ export const register: Register = (on, options) => {
               <Text color={m.flashColor} bold>{m.flashText}</Text>
             </Box>
           )}
+          {m.tally !== '' && (
+            <Box flexShrink={0}>
+              <Text dimColor>{m.tally}</Text>
+            </Box>
+          )}
           {shown.flatMap(p => [
             <Box flexShrink={0}><Text dimColor>·</Text></Box>,
             <Box flexShrink={0}>{m.title !== '' && p === shown[0] && details[0] === m.title ? <Text>{p}</Text> : <Text dimColor>{p}</Text>}</Box>,
@@ -1844,7 +1871,7 @@ export const register: Register = (on, options) => {
         </Box>
         {isJudging() && (
           <Box flexShrink={0}>
-            <Button key="threads" label="Threads" onPress={() => showPane($)} />
+            <Button key="threads" label="Threads" onPress={() => showThreads($)} />
           </Box>
         )}
         {m.canToggle && (
@@ -1977,6 +2004,7 @@ export const register: Register = (on, options) => {
         </Box>
         {m.title !== '' && <Text>{m.title}</Text>}
         {m.isFlash && <Text color={m.flashColor} bold>{m.flashText}</Text>}
+        {m.tally !== '' && <Text dimColor>{m.tally}</Text>}
         {m.parts.map(p => (
           <Text dimColor>{p}</Text>
         ))}
@@ -1984,7 +2012,7 @@ export const register: Register = (on, options) => {
           {m.canToggle && <Button key="toggle" label={m.isOn ? 'Stop' : 'Keep warm'} onPress={() => setKeepWarm($, !m.isOn, 0)} />}
           {isJudging() && <Button key="file" label="File now" onPress={() => void judgeAndFile($, 'open')} />}
         </Box>
-        {live.version !== '' && <Text dimColor>{`${PLUGIN_NAME} ${buildLabel()}`}</Text>}
+        <Text dimColor>{`${PLUGIN_NAME} ${buildDetail()}`}</Text>
         {threads}
       </Box>
     )

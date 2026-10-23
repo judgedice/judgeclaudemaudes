@@ -1,7 +1,8 @@
 import { expect, mock, test } from 'claude-code/testing'
 
 import { mdText, threadsReply } from '../hooks/format'
-import { briefOf, fromBase64, toBase64 } from '../hooks/judge'
+import { briefOf, buildOf, fromBase64, toBase64 } from '../hooks/judge'
+import { RELEASE } from '../hooks/version'
 import type { Manifest, ManifestThread, ProjectArchive } from '../types'
 
 const OPTIONS = { manifest_repo: 'me/claude-threads', account_label: 'work', github_token: 'ghp_test', file_threads: true }
@@ -107,7 +108,7 @@ function fakeGithub(repo: Repo) {
   }
 }
 
-type Extra = { env?: Record<string, string>; local?: string[]; version?: string; sessionId?: string }
+type Extra = { env?: Record<string, string>; local?: string[]; version?: string; sessionId?: string; noPanes?: boolean }
 const PROJECTS_DIR = '/home/me/.claude/projects'
 
 // Stands for the engine beneath the mod. `local` lists the session ids whose transcripts this
@@ -135,9 +136,13 @@ function engine(on: Parameters<Parameters<typeof test>[1]>[1], files: Record<str
     toasts.push(e.text)
     return { value: undefined }
   })
+  on('ui.log', (_, e) => {
+    toasts.push(`log: ${e.text}`)
+    return { value: undefined }
+  })
   on('ui.open', (_, e) => {
     opened.push(e.id)
-    return { value: { isPlaced: true } }
+    return { value: extra.noPanes ? { isPlaced: false, reason: 'no surface places panes' } : { isPlaced: true } }
   })
   on('fs.read', (_, e) => {
     if (e.path.endsWith('/.claude-plugin/plugin.json')) return { value: JSON.stringify({ name: 'judge-keep-warm', version: extra.version ?? '9.9.9' }) }
@@ -300,7 +305,7 @@ test('the pane lists the threads on every surface, and merges the ones picked', 
   for (const surface of ['terminal', 'desktop', 'vscode', 'mobile'] as const) {
     const ui = await $.ui.mount({ ...PANE, surface })
     expect((await ui.find({ type: 'Text', text: /^Judgeiverse$/ }))?.text).toBe('Judgeiverse')
-    expect((await ui.find({ type: 'Text', text: /^judge-keep-warm / }))?.text).toBe('judge-keep-warm v9.9.9')
+    expect((await ui.find({ type: 'Text', text: /^judge-keep-warm / }))?.text).toBe(`judge-keep-warm v${RELEASE} · 9.9.9`)
     expect((await ui.find({ type: 'Text', text: /open threads? ·/ }))?.text).toContain('2 open threads · 1 project · read ')
     expect((await ui.find({ key: 'view-project' }))?.props['label']).toBe('This project (2)')
     const list = await ui.find({ type: 'Markdown' })
@@ -332,7 +337,7 @@ test('the pane lists the threads on every surface, and merges the ones picked', 
   // The band counts the merge as an update to the manifest.
   const band = await $.ui.mount({ ...BAND, surface: 'desktop' })
   expect((await band.find({ type: 'Text', text: /^\d+ updates?$/ }))?.text).toBe('1 update')
-  expect((await band.find({ type: 'Text', text: /^v\d/ }))?.text).toBe('v9.9.9')
+  expect((await band.find({ type: 'Text', text: /^v\d/ }))?.text).toBe(`v${RELEASE}`)
   expect(await band.find({ key: 'threads' })).toBeDefined()
   await band.unmount()
 })
@@ -376,4 +381,72 @@ test('a failed filing is tried once per cache expiry, not on every tick', { opti
   const band = await $.ui.mount({ ...BAND, surface: 'terminal' })
   expect((await band.find({ type: 'Text', text: /^filing failed$/ }))?.text).toBe('filing failed')
   await band.unmount()
+})
+
+test('the build is the release, and a commit folder is cut to seven characters', async () => {
+  expect(buildOf('806d383b9573', 'judge-keep-warm')).toBe('806d383')
+  expect(buildOf('806d383b9573ae96d9b021861d18b7737aec7187', 'judge-keep-warm')).toBe('806d383')
+  expect(buildOf('judge-keep-warm', 'judge-keep-warm')).toBe('')
+  expect(RELEASE).toMatch(/^\d+\.\d+\.\d+$/)
+})
+
+test('on a narrow line the release and the tally stay, the details give way', { options: OPTIONS }, async ($, on) => {
+  mock.clock(on, { now: START })
+  mock.store(on)
+  engine(on, repoFiles(THREADS.slice(0, 2)))
+
+  await $.session.start({ cwd: '/work/app', surface: 'desktop', isInteractive: true })
+  await $.command.run({ command: 'judge', args: `delete ${DROP}` })
+
+  const band = await $.ui.mount({ ...BAND, props: { ...BAND.props, bodyColumns: 100 }, surface: 'desktop' })
+  expect((await band.find({ type: 'Text', text: /^v\d/ }))?.text).toBe(`v${RELEASE}`)
+  expect((await band.find({ type: 'Text', text: /^\d+ updates?$/ }))?.text).toBe('1 update')
+  expect(await band.find({ key: 'threads' })).toBeDefined()
+  await band.unmount()
+})
+
+test('Threads lists the threads in the chat where no pane can open', { options: OPTIONS }, async ($, on) => {
+  const clock = mock.clock(on, { now: START })
+  mock.store(on)
+  const { toasts, opened } = engine(on, repoFiles(THREADS.slice(0, 2)), { noPanes: true })
+  // The kit runs a mod's own $.command.run past the mod's hooks, so this hook stands for the
+  // engine running /judge: in a session the mod's own /judge hook answers it.
+  const runs: string[] = []
+  on('command.run', (_, e) => {
+    runs.push(`${e.command} ${e.args}`)
+    return { text: '' }
+  })
+
+  await $.session.start({ cwd: '/work/app', surface: 'desktop', isInteractive: true })
+  await clock.advance(1)
+
+  const band = await $.ui.mount({ ...BAND, surface: 'desktop' })
+  await band.press({ key: 'threads' })
+  await band.unmount()
+
+  expect(opened).toContain('judgeiverse')
+  expect(toasts).toContain('Judge: no pane can open here, so the threads are listed in the chat.')
+  expect(runs).toEqual(['judge threads'])
+  expect(toasts.filter(t => t.startsWith('log: '))).toEqual([])
+})
+
+test('Threads opens the pane where one can, and runs nothing in the chat', { options: OPTIONS }, async ($, on) => {
+  const clock = mock.clock(on, { now: START })
+  mock.store(on)
+  const { toasts, opened } = engine(on, repoFiles(THREADS.slice(0, 2)))
+  const runs: string[] = []
+  on('command.run', (_, e) => {
+    runs.push(`${e.command} ${e.args}`)
+    return { text: '' }
+  })
+
+  await $.session.start({ cwd: '/work/app', surface: 'desktop', isInteractive: true })
+  await clock.advance(1)
+  const band = await $.ui.mount({ ...BAND, surface: 'desktop' })
+  await band.press({ key: 'threads' })
+  await band.unmount()
+
+  expect(opened).toEqual(['judgeiverse'])
+  expect(runs).toEqual([])
+  expect(toasts.some(t => t.includes('no pane can open'))).toBe(false)
 })

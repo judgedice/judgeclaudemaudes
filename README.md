@@ -21,11 +21,12 @@ A fork of [Cache Keep-Warm](https://github.com/andreichiritescu/claude-code-cach
 
 The line above the prompt reads, left to right:
 
-- **`Judgeiverse`**, in cyan: the line's name, so you can tell it from any other line at a glance, then the build, dim: `v1.2.0` for a release, else the commit the install came from (or `dev` from a working folder).
+- **`Judgeiverse`**, in cyan: the line's name, so you can tell it from any other line at a glance, then the release, dim (`v0.6.0`). The pane and `/judge` add the commit the install came from (`v0.6.0 · 806d383`).
 - **The circle and the bar:** how much of the cache's life is left, green while keep-warm holds it.
 - **The time left** and when the cache expires, or `cold since HH:MM`.
-- **The details,** dim: the thread's title, keep-warm's state and next ping, what a cold cache would re-write, `manifest updated HH:MM` or `filing failed`, the tally (`3 updates`: this session's commits to the manifest, its filings, merges, deletions and deleted threads taken out), `N related threads`, and what the manifest held when this session last read or wrote it (`12 threads · 4 projects`). Details that do not fit are left off from the right.
-- **Threads**, then **Keep warm** or **Stop**, at the right end.
+- **The tally,** dim: `3 updates`, this session's commits to the manifest (its filings, merges, deletions and deleted threads taken out). It keeps its place however narrow the window.
+- **The details,** dim: the thread's title, keep-warm's state and next ping, what a cold cache would re-write, `manifest updated HH:MM` or `filing failed`, `N related threads`, and what the manifest held when this session last read or wrote it (`12 threads · 4 projects`). Details that do not fit are left off from the right.
+- **Threads**, then **Keep warm** or **Stop**, at the right end. **Threads** opens the Judgeiverse pane; where the app shows no panes, it lists the threads in the chat instead, as `/judge threads` does.
 
 Each time this session updates the manifest, the line lights up for about 8 seconds: `Judgeiverse` turns bold green and `✓ manifest updated HH:MM` appears after the time left, then the line goes back to dim with `manifest updated HH:MM` in the details and the tally one higher. A failed filing lights it red with `✗ filing failed` the same way. The toasts still come as before. The line stays one row on a narrow window; the details are cut at the right, never wrapped.
 
@@ -125,6 +126,6 @@ Check it before installing: `claude plugin validate --strict ./.claude-plugin/pl
 
 ## Development
 
-The mod is `hooks/register.tsx` (the keep-warm engine, the GitHub layer, the manifest transaction and the pane), `hooks/judge.ts` (pure helpers: the judge prompt, the bundling, the sub-manifests, the manifest's rendering) and `hooks/format.ts` (the markdown `/judge` and the pane print); its state contract is `types/index.d.ts`; the README the mod puts into an empty manifest repository is `manifest-repo/README.md`. `claude plugin validate --strict .` checks it; `claude plugin test .` runs `tests/`, which drive a filing against a GitHub kept in memory.
+The mod is `hooks/register.tsx` (the keep-warm engine, the GitHub layer, the manifest transaction and the pane), `hooks/judge.ts` (pure helpers: the judge prompt, the bundling, the sub-manifests, the manifest's rendering) and `hooks/format.ts` (the markdown `/judge` and the pane print); `hooks/version.ts` holds the release the line names: raise it with each release, while `plugin.json` stays without a `version` so every commit still reaches installed machines; its state contract is `types/index.d.ts`; the README the mod puts into an empty manifest repository is `manifest-repo/README.md`. `claude plugin validate --strict .` checks it; `claude plugin test .` runs `tests/`, which drive a filing against a GitHub kept in memory.
 
 MIT. A community mod, not made by Anthropic.

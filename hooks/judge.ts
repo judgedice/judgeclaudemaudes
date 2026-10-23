@@ -562,3 +562,11 @@ export function addToArchives(
   }
   return [...changed]
 }
+
+// The build an install folder names: Claude Code names a plugin's cache folder after the commit
+// it came from (12 characters, or the full 40), cut here to the usual seven. A folder named after
+// the plugin itself (a working copy) names none.
+export function buildOf(folder: string, pluginName: string) {
+  if (!folder || folder === pluginName) return ''
+  return /^[0-9a-f]{7,40}$/.test(folder) ? folder.slice(0, 7) : folder
+}
