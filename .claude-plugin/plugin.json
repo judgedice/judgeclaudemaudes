@@ -1,17 +1,16 @@
 {
   "name": "judge-keep-warm",
-  "displayName": "Judge Keep Warm",
-  "description": "Keeps a session's prompt cache warm and, when the cache is about to expire, files the thread into a GitHub manifest that it bundles into projects itself, through your own Claude Code connection, so you resume threads instead of opening new ones",
+  "displayName": "Judgeiverse",
+  "description": "Files each thread into a GitHub manifest once the conversation pauses after a turn, judged by a fork of the conversation and bundled into projects through your own Claude Code connection, so a cold session can be cleared and its thread resumed from any machine",
   "author": {
     "name": "Marvin Di Cesaro",
     "url": "https://github.com/judgedice"
   },
   "license": "MIT",
   "keywords": [
-    "prompt-cache",
-    "keep-warm",
     "threads",
     "manifest",
+    "resume",
     "github",
     "mod"
   ],
@@ -39,7 +38,7 @@
     "file_threads": {
       "type": "boolean",
       "title": "File threads in the manifest",
-      "description": "When the cache is about to expire, write this thread's entry to the manifest repository. Off: only /judge file writes one.",
+      "description": "Two minutes after each turn, once the conversation has paused, judge this thread and write its entry to the manifest repository. Off: only /judge file writes one.",
       "default": true
     },
     "judge_model": {
@@ -47,12 +46,6 @@
       "title": "Judge model",
       "description": "The model that bundles the threads into projects when a thread is filed: an alias (haiku, sonnet, opus) or a full id. Empty: this session's own model.",
       "default": ""
-    },
-    "title_mark": {
-      "type": "boolean",
-      "title": "Mark the session title",
-      "description": "While keep-warm is on, put a green dot in front of the session's title in the desktop app's session list",
-      "default": true
     },
     "sweep_deleted": {
       "type": "boolean",

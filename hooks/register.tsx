@@ -1,20 +1,18 @@
-// Judge Keep Warm: Cache Keep-Warm (AndreiC81, MIT) with a judge layer. The keep-warm engine is
-// the upstream's: a countdown line, pings 5 minutes before the cache would expire, never on a
-// cold cache. The judge layer is new: when the cache is about to expire, the thread is filed into
-// a GitHub manifest (threads/<account>/<session>.json); with keep-warm on, the ping itself is the
-// judge, its reply the thread's summary; the mod bundles every thread into projects, and at session
-// start it says which open threads already cover this project. A pane lists them beside the chat;
-// threads merge within a project, and a deleted thread leaves the manifest for its project's
-// sub-manifest (projects/<slug>.json) as one line.
+// Judgeiverse: files each Claude Code thread into a GitHub manifest, so a session can be cleared
+// once it goes cold and its thread picked up again from any machine. After each turn, once the
+// conversation has paused, a fork of it judges the thread (what it is about, where it stands, its
+// project, the next step) and the verdict is filed as threads/<account>/<session>.json; the mod
+// bundles every thread into projects, and at session start it says which open threads already
+// cover this project. A pane lists them beside the chat; threads merge within a project, and a
+// deleted thread leaves the manifest for its project's sub-manifest (projects/<slug>.json) as one
+// line. Keeping the prompt cache warm is left to a mod of its own: this one began as a fork of
+// Cache Keep-Warm (AndreiC81, MIT), and its keep-warm engine was taken out in 0.8.0.
 import { update } from 'claude-code'
-import type { EngineInterface, ModelUsage, Register, SessionUsage } from 'claude-code'
+import type { EngineInterface, Register } from 'claude-code'
 
 import type {
   ArchivedThread,
   JudgeVerdict,
-  KeepWarmPing,
-  KeepWarmSaved,
-  KeepWarmTtl,
   Manifest,
   ManifestProject,
   ManifestThread,
@@ -67,63 +65,23 @@ import {
   unplacedThreads,
 } from './judge'
 
-const HOUR_MS = 60 * 60_000
-const FIVE_MIN_MS = 5 * 60_000
-// The cache lengths Claude Code offers today; a value seen elsewhere is still accepted.
-const KNOWN_TTLS_MS = [FIVE_MIN_MS, HOUR_MS]
-// Keep-warm only for a cache this long or longer: on a short cache, pinging every few
-// minutes costs more than the single re-write it saves after any real break.
-const KEEP_WARM_MIN_TTL_MS = 30 * 60_000
-// A ping goes out this long before the cache would expire (55 min into a 1-hour cache), and
-// never in its last minute: a cold cache is never pinged.
-const PING_LEAD_MS = 5 * 60_000
-const PING_MARGIN_MS = 60_000
-// After a failed ping, wait this long before trying again inside the window.
-const PING_RETRY_MS = 30_000
-// Without an explicit stop time, keep-warm stops itself after this many pings in a row.
-const MAX_PINGS = 20
-// One check every 15 s: local reads only (clock, session figures, settings), no model call.
+// A thread is filed once its conversation has paused this long after a turn. A cloud container
+// stops about 5 minutes after the last turn, so the judge and the commit still have time to
+// finish there; and the judge's fork reads a cache the turn has just written, whatever its length.
+const FILE_AFTER_IDLE_MS = 2 * 60_000
+// One check every 15 s: local reads only (the clock and the state), no model call.
 const TICK_MS = 15_000
-const PING_PENDING_MS = 5 * 60_000
-// A request reading at least this share of the conversation from cache found it still warm.
-const HIT_SHARE = 0.5
-// A re-write after a shorter gap is a change to the prompt (compaction, a model switch),
-// not an expiry, so it says nothing about the cache's length.
-const EVIDENCE_GAP_MS = FIVE_MIN_MS + 30_000
-// A reopened session reports how long ago its last answer came; count from a little before.
-const RESUME_MARGIN_MS = 3 * 60_000
-// With keep-warm off, the band names what is at stake once this little time is left.
-const EXPIRING_MS = 10 * 60_000
-const BAR_CELLS = 10
-const BAR_FULL = '▰'
-const BAR_EMPTY = '▱'
 const DETAIL_GAP = 2
-const CIRCLE_BY_QUARTER = ['◔', '◑', '◕', '⚫︎']
-const CIRCLE_COLD = '○'
+// The keep-warm builds put this in front of the app's session title while keep-warm was on.
 const TITLE_MARK = '🟢 '
-const TITLE_MARK_OPTION = 'title_mark'
 const TITLE_SYNC_MS = 5 * 60_000
 const GET_SESSION_TOOL = 'mcp__ccd_session_mgmt__get_session'
 const SET_TITLE_TOOL = 'mcp__ccd_session_mgmt__set_session_title'
 const TITLE_FIELD = /"title"\s*:\s*"((?:[^"\\]|\\.)*)"/
-const HISTORY_SHOWN = 5
-const PING_TEXT = 'Keep-warm ping. Reply with just "ok".'
-const COMMAND = 'keepwarm'
 const JUDGE_COMMAND = 'judge'
-const STORE_PREFIX = 'session:'
-const STORE_MAX_AGE_MS = 7 * 24 * HOUR_MS
-const PLAN_TTL_KEY = 'plan-ttl'
-const PLAN_WINDOWS = ['five_hour', 'seven_day']
-const PLAN_LIMIT_PERCENT = 100
-const TTL_VALUE = /^(\d+)\s*(s|m|h)$/
-const DURATION = /^(\d+(?:\.\d+)?)\s*(h|m|min)$/
-const UNTIL = /^until\s+(\d{1,2}):(\d{2})$/
-const WAITS_TEXT = 'keep-warm starts after your next message'
-const VISIBLE_PING_TEXT = 'Keep-warm ping from the Judge Keep Warm mod. Reply with exactly "ok" and nothing else. Use no tools.'
-const SHOWS_IN_CHAT = ' (shows in chat)'
-const VISIBLE_PING_ROOM = 30_000
-const VISIBLE_PING_MAX_FILL = 0.75
-const NEARLY_FULL_TEXT = 'conversation nearly full: keep-warm waits for you'
+// What the keep-warm builds kept in the store (a session's countdown, the plan's cache length);
+// nothing reads it now, so it is taken out at start.
+const OLD_STORE_KEY = /^(session:|plan-ttl$)/
 
 // The judge layer's own constants.
 const GITHUB_API = 'https://api.github.com'
@@ -139,10 +97,6 @@ const MANIFEST_MD = 'MANIFEST.md'
 // Files of the manifest repository are kept in the store by blob sha, so a filing fetches only
 // what changed since the last one.
 const BLOB_PREFIX = 'blob:'
-// A thread already filed for this expiry is filed again only when the judge's verdict changed,
-// or this much later: a thread kept warm all night is not re-judged (and the action not re-run)
-// every 55 minutes for nothing.
-const REFILE_MS = 6 * HOUR_MS
 // How many related threads the start-of-session notice names.
 const RELATED_SHOWN = 3
 const PLUGIN_NAME = 'judge-keep-warm'
@@ -152,12 +106,12 @@ const LABEL_COLOR = 'cyan'
 // Where no surface draws the band above the prompt (a cloud session's chat), the same content
 // goes into a pane, opened this long after start unless the band has been asked for by then.
 const PANE = 'judgeiverse'
-const PANE_TITLE = 'Judgeiverse keep warm'
+const PANE_TITLE = 'Judgeiverse'
 const PANE_DECIDE_MS = 6000
 // The thread's title in the line is cut to this many characters.
 const TITLE_SHOWN = 40
 const TITLE_MIN = 12
-// Room the toggle button and the gaps take, in columns, when fitting the details to the line;
+// Room the File now button and the gaps take, in columns, when fitting the details to the line;
 // and the Threads button beside it.
 const BUTTON_COLUMNS = 14
 const THREADS_BUTTON_COLUMNS = 12
@@ -165,31 +119,16 @@ const THREADS_BUTTON_COLUMNS = 12
 const PANE_FRESH_MS = 5 * 60_000
 // The thread titles the pane's buttons show are cut to this.
 const BUTTON_TITLE_MAX = 48
-// The pane's drawn cache bar, in CSS pixels, where the surface takes drawings.
-const BAR_PX = 120
-const BAR_PX_HIGH = 6
 const FILED_BY: Record<ThreadEntry['filedBy'], string> = { judge: 'by the judge', local: 'local summary', end: 'at the end' }
 const FIT_MARGIN = 4
 // How long a filing's outcome stays lit on the line before it goes back to dim.
 const FLASH_MS = 8000
 
-const LAST = { plugin: 'judge-keep-warm', key: 'lastRequestAt' } as const
-const KEEP_WARM = { plugin: 'judge-keep-warm', key: 'keepWarm' } as const
-const STOP_AT = { plugin: 'judge-keep-warm', key: 'stopAt' } as const
 const NOW = { plugin: 'judge-keep-warm', key: 'now' } as const
-const PINGS = { plugin: 'judge-keep-warm', key: 'pings' } as const
-const TTL = { plugin: 'judge-keep-warm', key: 'ttl' } as const
-const CONTEXT = { plugin: 'judge-keep-warm', key: 'contextTokens' } as const
-const WAITING = { plugin: 'judge-keep-warm', key: 'isWaiting' } as const
-const SAW_RESPONSE = { plugin: 'judge-keep-warm', key: 'sawResponse' } as const
-const SHORT_AFTER = { plugin: 'judge-keep-warm', key: 'shortAfterMs' } as const
-const WAITS = { plugin: 'judge-keep-warm', key: 'waitsForMessage' } as const
-const RESTORED = { plugin: 'judge-keep-warm', key: 'restored' } as const
-const PING_ERROR = { plugin: 'judge-keep-warm', key: 'pingError' } as const
-const NEARLY_FULL = { plugin: 'judge-keep-warm', key: 'nearlyFull' } as const
+const FILE_DUE = { plugin: 'judge-keep-warm', key: 'fileDueAt' } as const
+const FILING_NOW = { plugin: 'judge-keep-warm', key: 'filingNow' } as const
 const VERDICT = { plugin: 'judge-keep-warm', key: 'verdict' } as const
 const FILING = { plugin: 'judge-keep-warm', key: 'filing' } as const
-const FILED_FOR = { plugin: 'judge-keep-warm', key: 'filedForExpiry' } as const
 const RELATED = { plugin: 'judge-keep-warm', key: 'related' } as const
 const ACTIVE = { plugin: 'judge-keep-warm', key: 'lastActiveAt' } as const
 const MANIFEST_THREADS = { plugin: 'judge-keep-warm', key: 'manifestThreads' } as const
@@ -212,16 +151,15 @@ const PANE_OPEN_ARCHIVE = { plugin: 'judge-keep-warm', key: 'paneOpenArchive' } 
 
 // The module's own variables start over on a reload; what must survive one is in $.state.
 const live: {
-  storeKey: string
-  pingPendingUntil: number
-  shownKey: string
-  titleMark: boolean
-  planTtl: KeepWarmTtl | undefined
-  savedTtl: KeepWarmTtl | undefined
-  isFirstRequest: boolean
-  visiblePingAt: number
-  pingTurnId: string
-  roomChecked: boolean
+  // The session this process files for, to tell a /clear or another session resumed here from a
+  // relaunch of the same one; '' before the first start.
+  sessionId: string
+  // True from a main-loop turn's start to its end: a filing waits for the pause after it.
+  isTurnRunning: boolean
+  // The minute the line last showed, so the clock redraws it once a minute, not every tick.
+  shownMinute: number
+  // A thread a /clear ended before its filing was due: captured as it ended, filed by the next tick.
+  endedThread: { snap: ThreadSnapshot; verdict: JudgeVerdict } | null
   // The judge layer: the manifest repository (owner/repo, '' = not configured), the account's
   // label, whether threads are filed by themselves, the token option, the token once resolved
   // (null = not yet tried), the host's names, and whether a filing is under way.
@@ -247,16 +185,10 @@ const live: {
   // Take threads whose session was deleted on this machine out of the manifest.
   sweepDeleted: boolean
 } = {
-  storeKey: '',
-  pingPendingUntil: 0,
-  shownKey: '',
-  titleMark: true,
-  planTtl: undefined,
-  savedTtl: undefined,
-  isFirstRequest: true,
-  visiblePingAt: 0,
-  pingTurnId: '',
-  roomChecked: false,
+  sessionId: '',
+  isTurnRunning: false,
+  shownMinute: 0,
+  endedThread: null,
   repo: '',
   account: '',
   fileThreads: true,
@@ -284,14 +216,6 @@ function clockTime(ms: number) {
   return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`
 }
 
-function tokens(n: number) {
-  return n >= 1_000_000 ? `${(n / 1_000_000).toFixed(1)}M` : `${Math.round(n / 1000)}k`
-}
-
-function timeLeft(ms: number) {
-  return ms < 60_000 ? 'under a minute left' : `${minutes(ms)} min left`
-}
-
 // The counter's parts: what the manifest held when last read or written, and the tally of
 // updates this session made to it. Empty before any of them is known.
 function counter(threads: number, projects: number, updates: number) {
@@ -301,99 +225,16 @@ function counter(threads: number, projects: number, updates: number) {
   return parts
 }
 
-function cacheLength(ms: number) {
-  return ms >= HOUR_MS && ms % HOUR_MS === 0 ? `${ms / HOUR_MS}-hour` : `${minutes(ms)}-minute`
-}
-
-function parseTtl(value: unknown) {
-  if (typeof value !== 'string') return 0
-  const m = TTL_VALUE.exec(value.trim())
-  if (!m) return 0
-  return Number(m[1]) * (m[2] === 'h' ? HOUR_MS : m[2] === 'm' ? 60_000 : 1000)
-}
-
-async function rememberPlan($: EngineInterface, ttl: NonNullable<KeepWarmTtl>): Promise<KeepWarmTtl> {
-  if (live.planTtl?.ms !== ttl.ms || live.planTtl?.reason !== ttl.reason) {
-    live.planTtl = ttl
-    await $.store.set(PLAN_TTL_KEY, ttl)
-  }
-  return ttl
-}
-
-// The same precedence Claude Code itself applies, then the plan: a subscription within its
-// limits gets the hour, one over its limit (paying usage credits) and an API key get 5 minutes.
-async function detectTtl($: EngineInterface, usage: SessionUsage): Promise<KeepWarmTtl> {
-  if ((await $.env.get('FORCE_PROMPT_CACHING_5M')) === '1') return { ms: FIVE_MIN_MS, reason: 'setting' }
-  const fromEnv = parseTtl(await $.env.get('CLAUDE_CODE_PROMPT_CACHE_TTL'))
-  if (fromEnv) return { ms: fromEnv, reason: 'setting' }
-  const settings = await $.settings.read()
-  const fromSettings = parseTtl(settings['promptCacheTtl'])
-  if (fromSettings) return { ms: fromSettings, reason: 'setting' }
-  if ((await $.env.get('ENABLE_PROMPT_CACHING_1H')) === '1') return { ms: HOUR_MS, reason: 'setting' }
-
-  const plan = usage.rateLimits.filter(w => PLAN_WINDOWS.includes(w.kind))
-  if (plan.length === 0) {
-    const { value: sawResponse = false } = await $.state.get(SAW_RESPONSE)
-    if (!sawResponse) return live.savedTtl ?? live.planTtl ?? null
-    return rememberPlan($, { ms: FIVE_MIN_MS, reason: 'api' })
-  }
-  return rememberPlan(
-    $,
-    plan.some(w => w.percentUsed >= PLAN_LIMIT_PERCENT) ? { ms: FIVE_MIN_MS, reason: 'overage' } : { ms: HOUR_MS, reason: 'subscription' },
-  )
-}
-
-function correctTtl(base: KeepWarmTtl, shortAfterMs: number): KeepWarmTtl {
-  if (!base || shortAfterMs <= 0 || shortAfterMs >= base.ms - PING_MARGIN_MS) return base
-  const shorter = KNOWN_TTLS_MS.filter(ms => ms < shortAfterMs)
-  return { ms: shorter.length ? Math.max(...shorter) : FIVE_MIN_MS, reason: 'observed' }
-}
-
-async function observe($: EngineInterface, gapMs: number, usage: ModelUsage) {
-  const total = usage.cache_read_input_tokens + usage.cache_creation_input_tokens
-  if (total === 0 || gapMs < EVIDENCE_GAP_MS) return
-  if (usage.cache_read_input_tokens >= HIT_SHARE * total) {
-    await $.state.set(SHORT_AFTER, 0)
-    return
-  }
-  const { value: ttl = null } = await $.state.get(TTL)
-  const { value: shortAfter = 0 } = await $.state.get(SHORT_AFTER)
-  const expected = ttl?.reason === 'observed' ? HOUR_MS : (ttl?.ms ?? HOUR_MS)
-  if (gapMs < expected - PING_MARGIN_MS) await $.state.set(SHORT_AFTER, shortAfter > 0 ? Math.min(shortAfter, gapMs) : gapMs)
-}
-
-async function save($: EngineInterface) {
-  if (!live.storeKey) return
-  const { value: lastRequestAt = 0 } = await $.state.get(LAST)
-  const { value: keepWarm = false } = await $.state.get(KEEP_WARM)
-  const { value: stopAt = 0 } = await $.state.get(STOP_AT)
-  const { value: ttl = null } = await $.state.get(TTL)
-  const saved: KeepWarmSaved = { lastRequestAt, keepWarm, stopAt, ttl, savedAt: await $.clock.now() }
-  await $.store.set(live.storeKey, saved)
-}
-
-async function setKeepWarm($: EngineInterface, isOn: boolean, stopAt: number) {
-  await $.state.set(KEEP_WARM, isOn)
-  await $.state.set(STOP_AT, isOn ? stopAt : 0)
-  await $.state.set(PINGS, [])
-  await $.state.set(PING_ERROR, '')
-  await save($)
-  await syncTitle($)
-}
-
-// The conversation starts over (cleared, or replaced by its summary): nothing of it is cached
-// until the next request writes it.
+// The conversation starts over (a /clear, or another session resumed in this process): what the
+// mod knew of the thread was the old one's.
 async function startOver($: EngineInterface) {
-  await $.state.set(LAST, 0)
-  await $.state.set(PINGS, [])
-  await $.state.set(SAW_RESPONSE, false)
-  await $.state.set(CONTEXT, 0)
-  await $.state.set(PING_ERROR, '')
-  await $.state.set(FILED_FOR, 0)
+  await $.state.set(FILE_DUE, 0)
+  await $.state.set(ACTIVE, 0)
+  await $.state.set(VERDICT, null)
+  await $.state.set(FILING, null)
+  await $.state.set(SELF_ARCHIVED, null)
+  await $.state.set(TITLE, '')
   await $.state.set(NOW, await $.clock.now())
-  live.roomChecked = false
-  const { value: restored = false } = await $.state.get(RESTORED)
-  if (restored) await save($)
 }
 
 // The session's title as the desktop app's list has it, without the mark; '' outside the app.
@@ -414,30 +255,28 @@ async function readTitle($: EngineInterface) {
 async function rememberTitle($: EngineInterface) {
   let title = await readTitle($)
   if (!title) {
-    const { value: sawResponse = false } = await $.state.get(SAW_RESPONSE)
-    title = sawResponse ? titleFrom(await $.session.messages(), await $.session.cwd()) : ''
+    const messages = await $.session.messages()
+    title = messages.length > 0 ? titleFrom(messages, await $.session.cwd()) : ''
   }
   const { value: was = '' } = await $.state.get(TITLE)
   if (title && title !== was) await $.state.set(TITLE, title)
 }
 
+// Keeps the line's title current, and takes off the green dot a keep-warm build left in front of
+// the app's session title.
 async function syncTitle($: EngineInterface) {
-  const { value: isOn = false } = await $.state.get(KEEP_WARM)
-  const { value: ttl = null } = await $.state.get(TTL)
-  const wantsMark = live.titleMark && isOn && !(ttl && ttl.ms < KEEP_WARM_MIN_TTL_MS)
-  await rememberTitle($)
   try {
+    await rememberTitle($)
     const found = await $.tool.call({ tool: GET_SESSION_TOOL, session_id: 'self' })
     if ('deny' in found && found.deny) return
     const match = TITLE_FIELD.exec(found.text ?? '')
     if (!match) return
     const title: string = JSON.parse(`"${match[1]}"`)
-    const hasMark = title.startsWith(TITLE_MARK)
-    if (wantsMark === hasMark) return
-    const base = hasMark ? title.slice(TITLE_MARK.length) : title
-    await $.tool.call({ tool: SET_TITLE_TOOL, session_id: 'self', title: wantsMark ? TITLE_MARK + base : base })
+    if (!title.startsWith(TITLE_MARK)) return
+    await $.tool.call({ tool: SET_TITLE_TOOL, session_id: 'self', title: title.slice(TITLE_MARK.length) })
   } catch {
-    // No session tools here (a terminal session), or the app declined the rename: leave the title.
+    // No session tools here (a terminal session), the app declined the rename, or the transcript
+    // could not be read: leave the title as it is.
   }
 }
 
@@ -1099,20 +938,6 @@ async function readVersion($: EngineInterface) {
   live.version = version || 'dev'
 }
 
-// The pane's cache bar as a drawing: a rounded track, filled for the share of the cache's life
-// left, green while keep-warm holds it. Neutral grey reads on light and dark themes alike.
-function cacheBarSvg(ratio: number, isGreen: boolean) {
-  const r = BAR_PX_HIGH / 2
-  const fill = ratio > 0 ? Math.max(BAR_PX_HIGH, Math.round(BAR_PX * ratio)) : 0
-  const color = isGreen ? '#3fb950' : '#8b949e'
-  return [
-    `<svg xmlns="http://www.w3.org/2000/svg" width="${BAR_PX}" height="${BAR_PX_HIGH}" viewBox="0 0 ${BAR_PX} ${BAR_PX_HIGH}">`,
-    `<rect width="${BAR_PX}" height="${BAR_PX_HIGH}" rx="${r}" fill="#8b949e" fill-opacity="0.25"/>`,
-    fill > 0 ? `<rect width="${fill}" height="${BAR_PX_HIGH}" rx="${r}" fill="${color}"/>` : '',
-    '</svg>',
-  ].join('')
-}
-
 // The release as the line shows it, short: `v0.6.0`.
 function buildLabel() {
   return `v${RELEASE}`
@@ -1170,48 +995,72 @@ async function endFlash($: EngineInterface) {
   if (until > 0 && (await $.clock.now()) >= until) await $.state.set(FLASH_UNTIL, 0)
 }
 
-// Builds this thread's entry from what the session knows and the verdict, and publishes it with
-// the manifest. `status` closed marks the thread done. Never throws: the outcome goes to the
-// FILING state, which the line and /judge show.
-async function fileThread($: EngineInterface, verdict: JudgeVerdict, by: ThreadEntry['filedBy'], status: ThreadEntry['status']) {
+/** What a filing needs of the thread, read at once before anything slow: a /clear may end the
+ * conversation while the judge or the commit runs, and the entry is still the ended thread's. */
+type ThreadSnapshot = {
+  sessionId: string
+  cwd: string
+  repo: string | null
+  messages: Parameters<typeof localVerdict>[0]
+  title: string
+  model: string
+  turns: number
+  surface: string
+  startedAt: number
+  contextTokens: number
+  lastActiveAt: number
+}
+
+async function captureThread($: EngineInterface): Promise<ThreadSnapshot> {
+  const cwd = await $.session.cwd()
+  const messages = await $.session.messages()
+  const usage = await $.session.usage()
+  const { value: title = '' } = await $.state.get(TITLE)
+  const { value: active = 0 } = await $.state.get(ACTIVE)
+  return {
+    sessionId: await $.session.id(),
+    cwd,
+    repo: (await $.session.repo())?.remote ?? null,
+    messages,
+    title: title || titleFrom(messages, cwd),
+    model: await $.session.model(),
+    turns: await $.session.turns(),
+    surface: (await $.session.surfaces())[0] ?? 'none',
+    startedAt: usage.startedAt,
+    contextTokens: usage.context.tokens ?? 0,
+    lastActiveAt: active,
+  }
+}
+
+// Builds the thread's entry from the snapshot and the verdict, and publishes it with the
+// manifest. `status` closed marks the thread done. Never throws: while the snapshot is still this
+// session's thread, the outcome goes to the FILING state, which the line and /judge show; a thread
+// a /clear ended meanwhile gets a toast alone.
+async function fileThread($: EngineInterface, verdict: JudgeVerdict, by: ThreadEntry['filedBy'], status: ThreadEntry['status'], snap: ThreadSnapshot) {
   if (!isJudging() || live.isFiling) return
   live.isFiling = true
+  await $.state.set(FILING_NOW, true)
   const t = await $.clock.now()
   let path = ''
-  // The expiry this filing is for: filed or failed, the thread is not filed again before it.
-  let expiresAt = 0
   try {
     await hostNames($)
-    const sessionId = await $.session.id()
-    const cwd = await $.session.cwd()
-    const repo = await $.session.repo()
-    const messages = await $.session.messages()
-    const usage = await $.session.usage()
-    const { value: last = 0 } = await $.state.get(LAST)
-    const { value: active = 0 } = await $.state.get(ACTIVE)
-    const { value: ttl = null } = await $.state.get(TTL)
-    const { value: contextTokens = 0 } = await $.state.get(CONTEXT)
-    const { value: keepWarm = false } = await $.state.get(KEEP_WARM)
-    const surfaces = await $.session.surfaces()
-    const title = (await readTitle($)) || titleFrom(messages, cwd)
-    await $.state.set(TITLE, title)
-    expiresAt = last > 0 ? last + (ttl?.ms ?? HOUR_MS) : 0
     const entry: ThreadEntry = {
       schema: 1,
-      sessionId,
+      sessionId: snap.sessionId,
       account: accountLabel(),
       host: live.host,
-      surface: surfaces[0] ?? 'none',
-      title,
-      cwd,
-      repo: repo?.remote ?? null,
-      model: await $.session.model(),
-      contextTokens,
-      turns: await $.session.turns(),
-      startedAt: new Date(usage.startedAt).toISOString(),
-      lastActiveAt: new Date(active || last || t).toISOString(),
-      cacheExpiresAt: expiresAt ? new Date(expiresAt).toISOString() : '',
-      keepWarm,
+      surface: snap.surface,
+      title: snap.title,
+      cwd: snap.cwd,
+      repo: snap.repo,
+      model: snap.model,
+      contextTokens: snap.contextTokens,
+      turns: snap.turns,
+      startedAt: new Date(snap.startedAt).toISOString(),
+      lastActiveAt: new Date(snap.lastActiveAt || t).toISOString(),
+      // Kept for the readers of older builds; this build keeps no cache warm.
+      cacheExpiresAt: '',
+      keepWarm: false,
       status,
       filedAt: new Date(t).toISOString(),
       filedBy: by,
@@ -1219,52 +1068,64 @@ async function fileThread($: EngineInterface, verdict: JudgeVerdict, by: ThreadE
       topics: verdict.topics,
       project: verdict.project,
       nextStep: verdict.nextStep,
-      resume: `claude --resume ${sessionId}`,
+      resume: `claude --resume ${snap.sessionId}`,
     }
-    path = threadPath(entry.account, sessionId)
+    path = threadPath(entry.account, snap.sessionId)
     const done = await transact($, { entry, by: accountLabel() })
+    if (snap.sessionId !== (await $.session.id())) {
+      if (done.kind !== 'archived') $.ui.toast(`Judge: the thread before the clear was ${done.kind} in ${live.repo}.`)
+      return
+    }
     if (done.kind === 'archived' && done.self) {
       // A merge or a deletion took this thread out: it is not filed again.
       const { value: wasArchived = null } = await $.state.get(SELF_ARCHIVED)
       await $.state.set(SELF_ARCHIVED, done.self)
-      await $.state.set(FILED_FOR, expiresAt)
       if (!wasArchived) $.ui.toast(`Judge: this thread was ${selfArchivedText(done.self, done.manifest)}.`)
       return
     }
     const { value: was = null } = await $.state.get(FILING)
     await $.state.set(FILING, { at: t, ok: true, path, error: '', by })
-    await $.state.set(FILED_FOR, expiresAt)
+    await $.state.set(TITLE, snap.title)
     await $.state.set(MANIFEST_THREADS, done.threads)
     await $.state.set(MANIFEST_PROJECTS, done.projects)
     const cleared = done.cleared.length ? ` ${plural(done.cleared.length, 'deleted thread')} taken out.` : ''
-    if (!was || !was.ok || by !== 'judge' || cleared) $.ui.toast(`Judge: thread ${done.kind} in ${live.repo}; ${done.threads} threads in ${done.projects} projects.${cleared}`)
+    // Filed after every pause: a toast for the first filing, a recovery, a new entry or deleted
+    // threads taken out; the line lights for every one.
+    if (!was || !was.ok || done.kind === 'created' || cleared) $.ui.toast(`Judge: thread ${done.kind} in ${live.repo}; ${done.threads} threads in ${done.projects} projects.${cleared}`)
   } catch (err) {
     const error = err instanceof Error ? err.message : String(err)
+    if (snap.sessionId !== (await $.session.id())) {
+      $.ui.toast(`Judge: filing the thread before the clear failed: ${error}`, { timeoutMs: 8000 })
+      return
+    }
     const { value: was = null } = await $.state.get(FILING)
     await $.state.set(FILING, { at: t, ok: false, path, error, by })
-    if (expiresAt > 0) await $.state.set(FILED_FOR, expiresAt)
     await $.state.set(FLASH_FAILED, true)
     await flash($)
     if (!was || was.ok || was.error !== error) $.ui.toast(`Judge: filing the thread failed: ${error}`, { timeoutMs: 8000 })
   } finally {
     live.isFiling = false
+    await $.state.set(FILING_NOW, false)
   }
 }
 
-// Judges the thread with a fork (reads the cache: keeps it warm too) and files the verdict;
-// falls back to the local summary when the fork cannot run. For /judge file and /judge close.
+// Judges the thread with a fork of the conversation and files the verdict; the local summary
+// when the fork cannot run. The fork reads the conversation from cache: right after a turn, where
+// the idle filing runs it, that is a cache read; on a cold cache it writes the cache afresh.
 async function judgeAndFile($: EngineInterface, status: ThreadEntry['status']) {
-  const r = await $.model.fork({ prompt: JUDGE_PROMPT })
-  if (r.isAnswered) {
-    const verdict = parseVerdict(r.text)
-    if (verdict) {
-      await $.state.set(VERDICT, verdict)
-      await fileThread($, verdict, 'judge', status === 'open' && verdict.isDone ? 'closed' : status)
-      return verdict
-    }
+  await rememberTitle($)
+  const snap = await captureThread($)
+  // A thread merged or deleted away is not filed again: no fork for it.
+  const { value: self = null } = await $.state.get(SELF_ARCHIVED)
+  const r = self ? null : await $.model.fork({ prompt: JUDGE_PROMPT })
+  const judged = r?.isAnswered ? parseVerdict(r.text) : null
+  if (judged) {
+    if (snap.sessionId === (await $.session.id())) await $.state.set(VERDICT, judged)
+    await fileThread($, judged, 'judge', status === 'open' && judged.isDone ? 'closed' : status, snap)
+    return judged
   }
-  const verdict = localVerdict(await $.session.messages())
-  await fileThread($, verdict, status === 'closed' ? 'end' : 'local', status)
+  const verdict = localVerdict(snap.messages)
+  await fileThread($, verdict, status === 'closed' ? 'end' : 'local', status, snap)
   return verdict
 }
 
@@ -1298,170 +1159,31 @@ async function loadRelated($: EngineInterface, isQuiet: boolean): Promise<{ rela
   }
 }
 
-// ---- The keep-warm engine ---------------------------------------------------------------------
+// ---- Filing when the conversation pauses -------------------------------------------------------
 
-// The ping re-sends the main thread's last request outside the conversation with one short
-// question after it: it reads the conversation from cache (restarting its life) and adds no
-// message. With the judge on, the question is the judge's, and its reply files the thread.
-async function ping($: EngineInterface, startedAt: number, lastRequestAt: number) {
-  const isJudge = isJudging() && live.fileThreads
-  const r = await $.model.fork({ prompt: isJudge ? JUDGE_PROMPT : PING_TEXT })
-  if (!r.isAnswered && r.reason === 'nothing-to-fork') {
-    await $.state.set(WAITS, true)
-    const { value: contextTokens = 0 } = await $.state.get(CONTEXT)
-    const { context } = await $.session.usage()
-    if (!(await checkRoom($, context.window, contextTokens))) await visiblePing($, startedAt)
-    return
-  }
-  if (!r.isAnswered && r.reason === 'api-error') {
-    const status = r.status ?? 0
-    if (status >= 400 && status < 500 && status !== 429) {
-      await $.state.set(PING_ERROR, `HTTP ${status}`)
-      $.ui.toast(`Keep-warm ping failed (HTTP ${status}); the cache will expire normally.`)
-      return
-    }
-    $.ui.toast(`Keep-warm ping failed (HTTP ${status || '?'}); retrying in ${PING_RETRY_MS / 1000} s.`)
-    live.pingPendingUntil = startedAt + PING_RETRY_MS
-    return
-  }
-  const { cache_read_input_tokens: read, cache_creation_input_tokens: written } = r.usage
-  const isHit = read > 0 && read >= HIT_SHARE * (read + written)
-  const done: KeepWarmPing = { at: startedAt, isHit, read }
-  const { value: pings = [] } = await $.state.get(PINGS)
-  await $.state.set(PINGS, [...pings, done].slice(-MAX_PINGS))
-  await observe($, startedAt - lastRequestAt, r.usage)
-  await $.state.set(LAST, startedAt)
-  await save($)
-  if (isJudge && r.isAnswered) {
-    const verdict = parseVerdict(r.text)
-    if (verdict) {
-      const { value: previous = null } = await $.state.get(VERDICT)
-      const { value: filing = null } = await $.state.get(FILING)
-      await $.state.set(VERDICT, verdict)
-      // The thread was filed for this process already: file again only when the verdict moved,
-      // the last filing failed, or it has been a while.
-      const isSame = previous !== null && previous.summary === verdict.summary && previous.isDone === verdict.isDone
-      if (!filing || !filing.ok || !isSame || startedAt - filing.at >= REFILE_MS) {
-        await fileThread($, verdict, 'judge', verdict.isDone ? 'closed' : 'open')
-      } else {
-        const { value: ttl = null } = await $.state.get(TTL)
-        await $.state.set(FILED_FOR, startedAt + (ttl?.ms ?? HOUR_MS))
-      }
-    }
-  }
-}
-
-async function visiblePingWontFit($: EngineInterface, window: number, contextTokens: number) {
-  try {
-    const { breakdown } = (await $.session.usage({ breakdown: 'summary' })).context
-    if (breakdown) {
-      const free = breakdown.categories.filter(c => c.kind === 'free').reduce((n, c) => n + c.tokens, 0)
-      const instructions = breakdown.memoryFiles.reduce((n, f) => n + f.tokens, 0)
-      return free < instructions + VISIBLE_PING_ROOM
-    }
-  } catch {
-    // No breakdown here: go by the share of the window below.
-  }
-  return window > 0 && contextTokens >= VISIBLE_PING_MAX_FILL * window
-}
-
-async function checkRoom($: EngineInterface, window: number, contextTokens: number) {
-  live.roomChecked = true
-  const wontFit = await visiblePingWontFit($, window, contextTokens)
-  const { value: was = false } = await $.state.get(NEARLY_FULL)
-  if (wontFit !== was) await $.state.set(NEARLY_FULL, wontFit)
-  return wontFit
-}
-
-async function visiblePing($: EngineInterface, startedAt: number) {
-  live.visiblePingAt = startedAt
-  const r = await $.prompt.submit({ text: VISIBLE_PING_TEXT })
-  if (typeof r.drop === 'string') {
-    live.visiblePingAt = 0
-    $.ui.toast(`Keep-warm ping not sent: ${r.drop}`)
-  }
-}
-
-// With the judge on, a thread whose cache is about to expire is filed once per expiry: at the
-// window's start when keep-warm is off (nothing else will), in its last minute when keep-warm is
-// on and the ping did not file it (blocked, failed, or visible).
-async function fileIfExpiring($: EngineInterface, t: number, last: number, ttl: KeepWarmTtl, isOn: boolean) {
-  if (!isJudging() || !live.fileThreads || !ttl || last === 0 || live.isFiling) return
-  const expiresAt = last + ttl.ms
-  const { value: filedFor = 0 } = await $.state.get(FILED_FOR)
-  if (filedFor === expiresAt) return
-  const canPing = isOn && ttl.ms >= KEEP_WARM_MIN_TTL_MS
-  const due = canPing ? expiresAt - PING_MARGIN_MS : expiresAt - PING_LEAD_MS
-  if (t < due) return
-  await fileThread($, localVerdict(await $.session.messages()), 'local', 'open')
-}
-
+// Each tick: the clock the line shows, once a minute; a thread a /clear ended, filed as captured;
+// and the filing a real turn made due, once the conversation has paused past its time with no turn
+// running. The due time is cleared before the filing runs, so a failed filing waits for the next
+// turn, not the next tick.
 async function tick($: EngineInterface) {
   const t = await $.clock.now()
   await endFlash($)
-  const usage = await $.session.usage()
-  const { value: shortAfter = 0 } = await $.state.get(SHORT_AFTER)
-  const ttl = correctTtl(await detectTtl($, usage), shortAfter)
-  const { value: last = 0 } = await $.state.get(LAST)
-
-  const { value: knownContext = 0 } = await $.state.get(CONTEXT)
-  const contextTokens = usage.context.tokens ?? knownContext
-  const shownKey = `${Math.floor(t / 60_000)}|${ttl?.ms ?? 0}|${ttl?.reason ?? ''}|${contextTokens}|${last}|${shortAfter}`
-  if (shownKey !== live.shownKey) {
-    live.shownKey = shownKey
-    await $.state.set(TTL, ttl)
-    await $.state.set(CONTEXT, contextTokens)
+  const minute = Math.floor(t / 60_000)
+  if (minute !== live.shownMinute) {
+    live.shownMinute = minute
     await $.state.set(NOW, t)
   }
-
-  const { value: isOn = false } = await $.state.get(KEEP_WARM)
-  if (!isOn) {
-    await fileIfExpiring($, t, last, ttl, false)
-    return
+  if (live.endedThread && !live.isFiling) {
+    const { snap, verdict } = live.endedThread
+    live.endedThread = null
+    await fileThread($, verdict, 'end', 'open', snap)
   }
-  const { value: sawResponse = false } = await $.state.get(SAW_RESPONSE)
-  const { value: waits = false } = await $.state.get(WAITS)
-  const needsVisible = !sawResponse || waits
-  if (needsVisible && !live.roomChecked) await checkRoom($, usage.context.window, contextTokens)
-  const { value: stopAt = 0 } = await $.state.get(STOP_AT)
-  if (stopAt > 0 && t >= stopAt) {
-    await setKeepWarm($, false, 0)
-    $.ui.toast(`Keep-warm stopped at ${clockTime(stopAt)} as asked; the cache will expire normally.`)
-    return
-  }
-  const idle = t - last
-  const isPingWindow =
-    ttl !== null &&
-    ttl.ms >= KEEP_WARM_MIN_TTL_MS &&
-    last > 0 &&
-    idle >= ttl.ms - PING_LEAD_MS &&
-    idle < ttl.ms - PING_MARGIN_MS
-  if (!isPingWindow || t < live.pingPendingUntil) {
-    await fileIfExpiring($, t, last, ttl, true)
-    return
-  }
-
-  const { value: pings = [] } = await $.state.get(PINGS)
-  if (stopAt === 0 && pings.length >= MAX_PINGS) {
-    await setKeepWarm($, false, 0)
-    $.ui.toast(`Keep-warm stopped itself after ${MAX_PINGS} pings in a row; the cache will expire.`)
-    return
-  }
-  live.pingPendingUntil = t + PING_PENDING_MS
-  const { value: nearlyFull = false } = await $.state.get(NEARLY_FULL)
-  if (!needsVisible) await ping($, t, last)
-  else if (!nearlyFull) await visiblePing($, t)
-}
-
-function parseStop(text: string, now: number) {
-  if (text === '') return 0
-  const duration = DURATION.exec(text)
-  if (duration) return now + Number(duration[1]) * (duration[2] === 'h' ? HOUR_MS : 60_000)
-  const until = UNTIL.exec(text)
-  if (!until) return -1
-  const at = new Date(now)
-  at.setHours(Number(until[1]), Number(until[2]), 0, 0)
-  return at.getTime() > now ? at.getTime() : at.getTime() + 24 * HOUR_MS
+  const { value: due = 0 } = await $.state.get(FILE_DUE)
+  if (due === 0 || t < due || live.isTurnRunning || live.isFiling) return
+  await $.state.set(FILE_DUE, 0)
+  const { value: self = null } = await $.state.get(SELF_ARCHIVED)
+  if (!isJudging() || !live.fileThreads || self) return
+  await judgeAndFile($, 'open')
 }
 
 // The details that fit beside the fixed parts in `columns`, in order, so nothing runs under the
@@ -1486,19 +1208,8 @@ function fitParts(parts: readonly string[], columns: number, fixed: number) {
 // Everything the band and the pane show, worked out once from the state: the same line on
 // either surface.
 async function lineModel($: EngineInterface) {
-  const { value: last = 0 } = await $.state.get(LAST)
-  const { value: now = 0 } = await $.state.get(NOW)
-  const { value: isOn = false } = await $.state.get(KEEP_WARM)
-  const { value: stopAt = 0 } = await $.state.get(STOP_AT)
-  const { value: pings = [] } = await $.state.get(PINGS)
-  const { value: ttl = null } = await $.state.get(TTL)
-  const { value: contextTokens = 0 } = await $.state.get(CONTEXT)
-  const { value: isWaiting = false } = await $.state.get(WAITING)
-  const { value: shortAfter = 0 } = await $.state.get(SHORT_AFTER)
-  const { value: waits = false } = await $.state.get(WAITS)
-  const { value: sawResponse = false } = await $.state.get(SAW_RESPONSE)
-  const { value: pingError = '' } = await $.state.get(PING_ERROR)
-  const { value: nearlyFull = false } = await $.state.get(NEARLY_FULL)
+  const { value: due = 0 } = await $.state.get(FILE_DUE)
+  const { value: filingNow = false } = await $.state.get(FILING_NOW)
   const { value: filing = null } = await $.state.get(FILING)
   const { value: related = [] } = await $.state.get(RELATED)
   const { value: manifestThreads = 0 } = await $.state.get(MANIFEST_THREADS)
@@ -1508,75 +1219,53 @@ async function lineModel($: EngineInterface) {
   const { value: flashFailed = false } = await $.state.get(FLASH_FAILED)
   const { value: flashUntil = 0 } = await $.state.get(FLASH_UNTIL)
   const { value: selfArchived = null } = await $.state.get(SELF_ARCHIVED)
-  const isBlocked = (!sawResponse || waits) && nearlyFull
-  // Lit for FLASH_MS after a commit to the manifest (green) or a failed filing (red).
+  const { value: manifest = null } = await $.state.get(MANIFEST)
+  // Lit for FLASH_MS after a commit to the manifest (green) or a failed filing (red), in place
+  // of where the thread stands.
   const isFlash = isJudging() && flashUntil > 0 && (await $.clock.now()) < flashUntil && (flashFailed ? filing !== null : updatedAt > 0)
   const flashColor = flashFailed ? 'red' : 'green'
+  const flashText = flashFailed ? '✗ filing failed' : `✓ manifest updated ${clockTime(updatedAt)}`
 
-  const t = Math.max(now, last)
-  const ttlMs = ttl?.ms ?? HOUR_MS
-  const canKeepWarm = ttl !== null && ttl.ms >= KEEP_WARM_MIN_TTL_MS
-  const isGreen = isOn && canKeepWarm && !pingError && !isBlocked
-  const expiresAt = last + ttlMs
-  const remaining = expiresAt - t
-  const isWarm = last > 0 && remaining > 0
-  const filled = isWarm ? Math.max(1, Math.ceil((remaining / ttlMs) * BAR_CELLS)) : 0
-  const quarters = CIRCLE_BY_QUARTER.length
-  const circle = isWarm
-    ? CIRCLE_BY_QUARTER[Math.min(quarters, Math.max(1, Math.ceil((remaining / ttlMs) * quarters))) - 1]
-    : CIRCLE_COLD
+  // Where this thread stands in the manifest: green once filed (by this process, or by an earlier
+  // one, so a relaunched session reads as safe to clear), red when the last filing failed.
+  const isListed = manifest?.projects.some(p => p.threads.some(t => t.sessionId === live.sessionId)) ?? false
+  let main = live.fileThreads ? 'not filed yet' : 'files on /judge file'
+  let tone: 'plain' | 'ok' | 'failed' = 'plain'
+  if (!isJudging()) {
+    main = 'no manifest repository set'
+  } else if (selfArchived) {
+    main = selfArchived.reason === 'merged' ? 'merged into another thread' : 'taken out of the manifest'
+  } else if (filingNow) {
+    main = 'filing…'
+  } else if (due > 0) {
+    main = `files at ${clockTime(due)}`
+  } else if (filing && !filing.ok) {
+    main = 'filing failed'
+    tone = 'failed'
+  } else if (filing) {
+    main = `filed ${clockTime(filing.at)}`
+    tone = 'ok'
+  } else if (isListed) {
+    main = 'in the manifest'
+    tone = 'ok'
+  }
 
-  const main = last === 0 ? 'nothing cached yet' : isWarm ? timeLeft(remaining) : `cold since ${clockTime(expiresAt)}`
-  const expiresText = isWarm ? ` (${clockTime(expiresAt)})` : ''
+  // How many other open threads the manifest holds for this project, and what it holds in all.
   const parts: string[] = []
-  if (isWaiting && isWarm) parts.push('waiting for your answer')
-
-  if (ttl && !canKeepWarm) {
-    if (ttl.reason === 'observed') parts.push(`cache expired after ${minutes(shortAfter)} min, sooner than expected`, 'keep-warm paused')
-    else if (ttl.reason === 'overage') parts.push(`${cacheLength(ttl.ms)} cache while over your plan limit`, 'keep-warm paused')
-    else parts.push(`${cacheLength(ttl.ms)} cache (${ttl.reason === 'api' ? 'API key' : 'your settings'})`, 'keep-warm needs the 1-hour cache')
-  } else if (isOn) {
-    const lastPing = pings[pings.length - 1]
-    if (stopAt) parts.push(`keep-warm stops ${clockTime(stopAt)}`)
-    if (pingError) parts.push(`ping failed: ${pingError}`)
-    else if (!ttl) parts.push(WAITS_TEXT)
-    else if (isBlocked) parts.push(NEARLY_FULL_TEXT)
-    else if (isWarm) parts.push(`next ping ${clockTime(last + ttlMs - PING_LEAD_MS)}${sawResponse && !waits ? '' : SHOWS_IN_CHAT}`)
-    if (lastPing) parts.push(`${pings.length} ping${pings.length === 1 ? '' : 's'} ${lastPing.isHit ? '✓' : '✗'}`)
-  }
-
-  if (contextTokens > 0 && last > 0) {
-    if (!isWarm) parts.push(`your next message re-writes ${tokens(contextTokens)}`, ...(isGreen ? ['keep-warm restarts after it'] : []))
-    else if (!isGreen && remaining < EXPIRING_MS) parts.push(`after ${clockTime(expiresAt)} your next message re-writes ${tokens(contextTokens)}`)
-    else parts.push(`${tokens(contextTokens)} cached`)
-  }
-
-  // The judge's part: when this session last updated the manifest, or that a filing failed; how
-  // many other open threads the manifest holds for this project, and what it holds in all. The
-  // pane shows those two in its threads section, so its facts stop before them.
-  let factsEnd = parts.length
   if (isJudging()) {
-    if (selfArchived) parts.push(selfArchived.reason === 'merged' ? 'merged into another thread' : 'taken out of the manifest')
-    else if (!isFlash && filing && !filing.ok && filing.at >= updatedAt) parts.push('filing failed')
-    else if (!isFlash && updatedAt > 0) parts.push(`manifest updated ${clockTime(updatedAt)}`)
-    factsEnd = parts.length
     if (related.length > 0) parts.push(`${related.length} related thread${related.length === 1 ? '' : 's'}`)
     parts.push(...counter(manifestThreads, manifestProjects, 0))
   }
 
-  const canToggle = isOn || !ttl || canKeepWarm || ttl.reason === 'overage' || ttl.reason === 'observed'
-  const flashText = flashFailed ? '✗ filing failed' : `✓ manifest updated ${clockTime(updatedAt)}`
   const { value: fullTitle = '' } = await $.state.get(TITLE)
   const title = fullTitle.length > TITLE_SHOWN ? `${fullTitle.slice(0, TITLE_SHOWN - 1)}…` : fullTitle
   // The tally of this session's updates to the manifest: a fixed part of the line, not a detail.
   const tally = isJudging() && updates > 0 ? plural(updates, 'update') : ''
-  const facts = parts.slice(0, factsEnd)
-  const ratio = isWarm ? Math.min(1, remaining / ttlMs) : 0
-  return { isFlash, flashColor, flashText, isGreen, circle, filled, main, expiresText, parts, canToggle, isOn, title, tally, facts, ratio, fullTitle, isWarm }
+  const canFile = isJudging() && !selfArchived
+  return { isFlash, flashColor, flashText, main, tone, parts, title, fullTitle, tally, canFile }
 }
 
 export const register: Register = (on, options) => {
-  live.titleMark = options[TITLE_MARK_OPTION] !== false
   live.repo = parseRepo(String(options[REPO_OPTION] ?? ''))
   live.account = String(options[ACCOUNT_OPTION] ?? '').trim()
   live.tokenOption = String(options[TOKEN_OPTION] ?? '')
@@ -1586,44 +1275,16 @@ export const register: Register = (on, options) => {
 
   on('session.start', async ($, e, next) => {
     await $.command.register({
-      name: COMMAND,
-      description: "Keep this session's prompt cache warm: on [3h | until 18:00], off, or status",
-      argumentHint: '[on [3h|until 18:00] | off]',
-      immediate: true,
-    })
-    await $.command.register({
       name: JUDGE_COMMAND,
       description: 'The thread manifest: status, file or close this thread, list the open threads of this project, open the pane, merge or delete threads',
       argumentHint: '[status | file | close | threads | pane | merge <keep> <other>… | delete <id>…]',
       immediate: true,
     })
 
-    live.storeKey = STORE_PREFIX + (await $.session.id())
-    live.isFirstRequest = true
+    live.sessionId = await $.session.id()
     await readVersion($)
-    const plan = (await $.store.get(PLAN_TTL_KEY)) as KeepWarmTtl | undefined
-    if (plan && typeof plan.ms === 'number') live.planTtl = plan
-
-    const { value: restored = false } = await $.state.get(RESTORED)
-    if (!restored) {
-      const saved = (await $.store.get(live.storeKey)) as KeepWarmSaved | undefined
-      if (saved) {
-        if (saved.ttl && typeof saved.ttl.ms === 'number') live.savedTtl = saved.ttl
-        const { value: last = 0 } = await $.state.get(LAST)
-        if (saved.lastRequestAt > last) await $.state.set(LAST, saved.lastRequestAt)
-        await $.state.set(KEEP_WARM, saved.keepWarm)
-        await $.state.set(STOP_AT, saved.stopAt ?? 0)
-      }
-      await $.state.set(RESTORED, true)
-      await save($)
-    }
-
-    const t = await $.clock.now()
     for (const key of await $.store.keys()) {
-      if (!key.startsWith(STORE_PREFIX) || key === live.storeKey) continue
-      const old = (await $.store.get(key)) as KeepWarmSaved | undefined
-      const at = old ? (old.savedAt ?? old.lastRequestAt) : 0
-      if (!old || (at > 0 ? t - at > STORE_MAX_AGE_MS : !old.keepWarm)) await $.store.delete(key)
+      if (OLD_STORE_KEY.test(key)) await $.store.delete(key)
     }
 
     await tick($)
@@ -1641,132 +1302,55 @@ export const register: Register = (on, options) => {
     return next(e)
   })
 
+  // A /clear, or another session resumed in this process, starts a new thread; a relaunch of the
+  // same session keeps it, and dates its last activity from the gap the engine reports.
   on('classic.SessionStart', async ($, e, next) => {
-    if (e.source === 'clear') await startOver($)
-    else if ((e.source === 'resume' || e.source === 'fork') && typeof e.seconds_since_last_response === 'number') {
-      const t = await $.clock.now()
-      const lastAt = t - e.seconds_since_last_response * 1000 - RESUME_MARGIN_MS
-      const { value: last = 0 } = await $.state.get(LAST)
-      if (lastAt > last) await $.state.set(LAST, lastAt)
+    const id = await $.session.id()
+    if (e.source === 'clear' || (live.sessionId !== '' && id !== live.sessionId)) await startOver($)
+    live.sessionId = id
+    if ((e.source === 'resume' || e.source === 'fork') && typeof e.seconds_since_last_response === 'number') {
+      const lastAt = (await $.clock.now()) - e.seconds_since_last_response * 1000
       const { value: active = 0 } = await $.state.get(ACTIVE)
       if (lastAt > active) await $.state.set(ACTIVE, lastAt)
-      if (e.context_tokens) await $.state.set(CONTEXT, e.context_tokens)
-      await $.state.set(NOW, t)
-      const { value: restored = false } = await $.state.get(RESTORED)
-      if (restored) await save($)
     }
     return next(e)
   })
 
-  on('session.compact', async ($, e, next) => {
-    const result = await next(e)
-    if (!e.agentId && e.trigger !== 'precompute' && result.skip === undefined) {
-      try {
-        await startOver($)
-      } catch {
-        // Never fail a compaction over the countdown.
-      }
-    }
-    return result
+  on('turn.start', async ($, e, next) => {
+    if (!e.agentId) live.isTurnRunning = true
+    return next(e)
   })
 
-  on('turn.step', async function* ($, e, next) {
-    if (e.agentId) return yield* next(e)
-    const t = await $.clock.now()
-    const { value: previous = 0 } = await $.state.get(LAST)
-    live.pingPendingUntil = 0
-    await $.state.set(LAST, t)
-    await $.state.set(NOW, t)
-    await save($)
-    const result = yield* next(e)
-    const u = result?.usage
-    if (!u || u.input_tokens + u.cache_read_input_tokens + u.cache_creation_input_tokens === 0) {
-      await $.state.set(LAST, previous)
-      await save($)
-      return result
-    }
-    await $.state.set(WAITS, false)
-    await $.state.set(PING_ERROR, '')
-    if (live.visiblePingAt > 0) {
-      const { cache_read_input_tokens: read, cache_creation_input_tokens: written } = u
-      const done: KeepWarmPing = { at: live.visiblePingAt, isHit: read > 0 && read >= HIT_SHARE * (read + written), read }
-      const { value: pings = [] } = await $.state.get(PINGS)
-      await $.state.set(PINGS, [...pings, done].slice(-MAX_PINGS))
-      live.visiblePingAt = 0
-      live.pingTurnId = e.turnId
-    }
-    const isFirst = live.isFirstRequest
-    live.isFirstRequest = false
-    if (previous > 0 && !isFirst) await observe($, t - previous, u)
-    return result
-  })
-
+  // A real turn makes the thread due to be filed once the conversation pauses; a turn that ends
+  // with nothing from the model (an interrupt, an API error) moves a filing already due past it.
   on('turn.complete', async ($, e, next) => {
     if (!e.agentId) {
-      const isPingTurn = e.turnId === live.pingTurnId
-      if (isPingTurn) live.pingTurnId = ''
+      live.isTurnRunning = false
+      const t = await $.clock.now()
       if (e.usage) {
-        await $.state.set(SAW_RESPONSE, true)
-        if (!isPingTurn) {
-          await $.state.set(PINGS, [])
-          // A real turn: the thread is active, and its next expiry is a new one to file.
-          await $.state.set(ACTIVE, await $.clock.now())
-          await rememberTitle($)
-        }
-      } else if (live.visiblePingAt > 0) {
-        live.visiblePingAt = 0
-        if (e.reason === 'error') {
-          const why = e.answer.trim() || 'an API error'
-          await $.state.set(PING_ERROR, why)
-          $.ui.toast(`Keep-warm ping failed: ${why}. The cache will expire normally.`)
-        }
+        await $.state.set(ACTIVE, t)
+        await rememberTitle($)
       }
+      const { value: due = 0 } = await $.state.get(FILE_DUE)
+      if (isJudging() && live.fileThreads && (e.usage || due > 0)) await $.state.set(FILE_DUE, t + FILE_AFTER_IDLE_MS)
     }
     return next(e)
   })
 
-  on('tool.call', { tool: 'AskUserQuestion' }, async ($, e, next) => {
-    await $.state.set(WAITING, true)
-    try {
-      return await next(e)
-    } finally {
-      await $.state.set(WAITING, false)
+  // A /clear, or another session resumed here, ends the thread before its filing was due. The hook
+  // has a second and a half and no fork can follow a /clear, so it captures the thread with what
+  // its transcript says, and the next tick, a few seconds on, commits it.
+  on('session.end', async ($, e, next) => {
+    const { value: due = 0 } = await $.state.get(FILE_DUE)
+    if (due > 0 && (e.reason === 'clear' || e.reason === 'resume') && isJudging() && live.fileThreads) {
+      await $.state.set(FILE_DUE, 0)
+      const snap = { ...(await captureThread($)), sessionId: e.sessionId }
+      // The judge's project and topics from the last filing still hold; the summary is the transcript's.
+      const { value: judged = null } = await $.state.get(VERDICT)
+      live.endedThread = { snap, verdict: { ...localVerdict(snap.messages), topics: judged?.topics ?? [], project: judged?.project ?? '' } }
     }
+    return next(e)
   })
-
-  on('command.run', { command: COMMAND }, async ($, e) => {
-    const t = await $.clock.now()
-    const words = e.args.trim().toLowerCase()
-    const [first = ''] = words.split(/\s+/)
-    if (first === 'off') {
-      await setKeepWarm($, false, 0)
-    } else if (words !== '' && words !== 'status') {
-      const stopAt = parseStop(first === 'on' ? words.slice(2).trim() : words, t)
-      if (stopAt < 0) return { text: 'Not understood. Try: /keepwarm on, /keepwarm 3h, /keepwarm until 18:00, /keepwarm off' }
-      await setKeepWarm($, true, stopAt)
-    }
-
-    const { value: isOn = false } = await $.state.get(KEEP_WARM)
-    const { value: stopAt = 0 } = await $.state.get(STOP_AT)
-    const { value: ttl = null } = await $.state.get(TTL)
-    const { value: pings = [] } = await $.state.get(PINGS)
-    const { value: waits = false } = await $.state.get(WAITS)
-    const { value: sawResponse = false } = await $.state.get(SAW_RESPONSE)
-    const lines = [
-      isOn
-        ? `Keep-warm on${stopAt ? ` until ${clockTime(stopAt)}` : ` (stops itself after ${MAX_PINGS} pings in a row)`}: about ${minutes(PING_LEAD_MS)} min before the cache would expire, it re-reads the conversation from cache in the background. A cold cache is never pinged.`
-        : 'Keep-warm off: the cache expires normally.',
-    ]
-    if (isOn && isJudging() && live.fileThreads) lines.push('Each ping is also the judge: its reply files this thread into the manifest.')
-    if (isOn && (waits || !sawResponse)) lines.push('Claude Code can repeat this conversation invisibly only once it has answered since the app started, so the next ping is a short message in the chat.')
-    if (ttl) lines.push(`This session's cache lasts ${cacheLength(ttl.ms)} (${ttl.reason === 'observed' ? 'seen expiring sooner than expected' : ttl.reason}).`)
-    if (ttl && ttl.ms < KEEP_WARM_MIN_TTL_MS) lines.push(`Keep-warm only pings a cache of ${minutes(KEEP_WARM_MIN_TTL_MS)} min or longer.`)
-    for (const p of pings.slice(-HISTORY_SHOWN)) {
-      lines.push(`${clockTime(p.at)} · ${p.isHit ? `read ${tokens(p.read)} from cache` : 'found the cache cold'}`)
-    }
-    return { text: lines.join('\n') }
-  })
-
   on('command.run', { command: JUDGE_COMMAND }, async ($, e) => {
     const [first = 'status', ...rest] = e.args.trim().split(/\s+/).filter(Boolean)
     const word = first.toLowerCase()
@@ -1833,7 +1417,7 @@ export const register: Register = (on, options) => {
     const lines = [
       `**Judge** ${mdText(buildDetail())} · manifest ${mdCode(live.repo)} · account ${mdCode(accountLabel())}`,
       '',
-      `- **Filing:** ${live.fileThreads ? "when this thread's cache is about to expire" : 'only on `/judge file`'}`,
+      `- **Filing:** ${live.fileThreads ? `${minutes(FILE_AFTER_IDLE_MS)} minutes after each turn, once the conversation pauses` : 'only on `/judge file`'}`,
       `- **Last filed:** ${filing ? (filing.ok ? `${clockTime(filing.at)}, ${FILED_BY[filing.by]}, at ${mdCode(filing.path)}` : `${clockTime(filing.at)}, failed: ${mdText(filing.error)}`) : 'not yet this session'}`,
     ]
     if (self) lines.push(`- **This thread:** ${mdText(selfArchivedText(self, manifest))}`)
@@ -1854,9 +1438,8 @@ export const register: Register = (on, options) => {
     const details = [...(m.title ? [m.title] : []), ...m.parts]
     const build = buildLabel()
     const fixed =
-      LABEL.length + DETAIL_GAP + build.length + DETAIL_GAP + 1 + DETAIL_GAP + BAR_CELLS + DETAIL_GAP + m.main.length + m.expiresText.length +
-      (m.isFlash ? DETAIL_GAP + m.flashText.length : 0) + (m.tally ? DETAIL_GAP + m.tally.length : 0) +
-      (m.canToggle ? BUTTON_COLUMNS : 0) + (isJudging() ? THREADS_BUTTON_COLUMNS : 0)
+      LABEL.length + DETAIL_GAP + build.length + DETAIL_GAP + (m.isFlash ? m.flashText : m.main).length +
+      (m.tally ? DETAIL_GAP + m.tally.length : 0) + (m.canFile ? BUTTON_COLUMNS : 0) + (isJudging() ? THREADS_BUTTON_COLUMNS : 0)
     const shown = fitParts(details, e.props.bodyColumns, fixed)
 
     return (
@@ -1869,21 +1452,14 @@ export const register: Register = (on, options) => {
             <Text dimColor>{build}</Text>
           </Box>
           <Box flexShrink={0}>
-            {m.isGreen ? <Text color="green" bold>{m.circle}</Text> : <Text dimColor>{m.circle}</Text>}
-          </Box>
-          <Box flexShrink={0}>
-            {m.isGreen ? <Text color="green">{BAR_FULL.repeat(m.filled)}</Text> : <Text dimColor>{BAR_FULL.repeat(m.filled)}</Text>}
-            <Text dimColor>{BAR_EMPTY.repeat(BAR_CELLS - m.filled)}</Text>
-          </Box>
-          <Box flexShrink={0}>
-            <Text bold>{m.main}</Text>
-            <Text dimColor>{m.expiresText}</Text>
-          </Box>
-          {m.isFlash && (
-            <Box flexShrink={0}>
+            {m.isFlash ? (
               <Text color={m.flashColor} bold>{m.flashText}</Text>
-            </Box>
-          )}
+            ) : m.tone === 'plain' ? (
+              <Text bold>{m.main}</Text>
+            ) : (
+              <Text color={m.tone === 'ok' ? 'green' : 'red'} bold>{m.main}</Text>
+            )}
+          </Box>
           {m.tally !== '' && (
             <Box flexShrink={0}>
               <Text dimColor>{m.tally}</Text>
@@ -1899,13 +1475,9 @@ export const register: Register = (on, options) => {
             <Button key="threads" label="Threads" onPress={() => showThreads($)} />
           </Box>
         )}
-        {m.canToggle && (
+        {m.canFile && (
           <Box flexShrink={0}>
-            <Button
-              key="toggle"
-              label={m.isOn ? 'Stop' : 'Keep warm'}
-              onPress={() => setKeepWarm($, !m.isOn, 0)}
-            />
+            <Button key="file" label="File now" onPress={() => void judgeAndFile($, 'open')} />
           </Box>
         )}
       </Box>
@@ -1920,21 +1492,6 @@ export const register: Register = (on, options) => {
     const m = await lineModel($)
     const flashKey = m.flashColor === 'red' ? 'error' : 'success'
 
-    // The cache's life: a drawn bar where the surface takes drawings, the line's cells on the terminal.
-    const bar =
-      e.surface === 'terminal' ? (
-        <Box flexShrink={0}>
-          {m.isGreen ? <Text color="green">{BAR_FULL.repeat(m.filled)}</Text> : <Text dimColor>{BAR_FULL.repeat(m.filled)}</Text>}
-          <Text dimColor>{BAR_EMPTY.repeat(BAR_CELLS - m.filled)}</Text>
-        </Box>
-      ) : (
-        (() => {
-          const { Svg } = $.ui.resolve(e)
-          return <Svg source={cacheBarSvg(m.ratio, m.isGreen)} alt={`${Math.round(m.ratio * 100)}% of the cache's life left`} width={BAR_PX} height={BAR_PX_HIGH} />
-        })()
-      )
-
-    const facts = [m.tally, ...m.facts].filter(p => p !== '')
     const card = (
       <Box flexDirection="column" rowGap="xs" paddingX="sm" paddingY="xs" borderStyle="round" borderColor={m.isFlash ? flashKey : 'subtle'}>
         <Box justifyContent="space-between" alignItems="center" columnGap="sm">
@@ -1944,17 +1501,17 @@ export const register: Register = (on, options) => {
         {m.fullTitle !== '' && (
           <Text size="heading" weight="semibold" wrap="truncate-end">{m.fullTitle}</Text>
         )}
-        <Box alignItems="center" columnGap="sm" flexWrap="wrap">
-          {bar}
-          <Text weight="medium" tabular color={m.isGreen ? 'success' : undefined}>{m.main}</Text>
-          {m.expiresText !== '' && <Text dimColor tabular>{`until ${m.expiresText.replace(/[ ()]/g, '')}`}</Text>}
-        </Box>
-        {m.isFlash && <Text color={flashKey} weight="semibold">{m.flashText}</Text>}
-        {facts.length > 0 && <Text size="footnote" dimColor>{facts.join(' · ')}</Text>}
-        <Box columnGap="sm" flexWrap="wrap">
-          {m.canToggle && <Button key="toggle" variant={m.isOn ? 'secondary' : 'primary'} label={m.isOn ? 'Stop' : 'Keep warm'} onPress={() => setKeepWarm($, !m.isOn, 0)} />}
-          {isJudging() && <Button key="file" label="File now" onPress={() => void judgeAndFile($, 'open')} />}
-        </Box>
+        {m.isFlash ? (
+          <Text color={flashKey} weight="semibold">{m.flashText}</Text>
+        ) : (
+          <Text weight="medium" tabular color={m.tone === 'ok' ? 'success' : m.tone === 'failed' ? 'error' : undefined}>{m.main}</Text>
+        )}
+        {m.tally !== '' && <Text size="footnote" dimColor>{m.tally}</Text>}
+        {m.canFile && (
+          <Box columnGap="sm" flexWrap="wrap">
+            <Button key="file" label="File now" onPress={() => void judgeAndFile($, 'open')} />
+          </Box>
+        )}
       </Box>
     )
     const threads = isJudging() ? await threadsSection() : null

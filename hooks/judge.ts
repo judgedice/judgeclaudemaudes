@@ -11,10 +11,10 @@ export const SUMMARY_MAX = 600
 export const TITLE_MAX = 80
 export const TOPICS_MAX = 8
 
-// The ping's one question. The fork reads the whole conversation from cache (which is what keeps
-// it warm) and answers with the verdict the manifest entry is built from.
+// The judge's one question. The fork reads the whole conversation from cache and answers with
+// the verdict the manifest entry is built from.
 export const JUDGE_PROMPT = [
-  'Judge Keep Warm ping. Use no tools. Answer with one JSON object on one line and nothing else:',
+  'Judgeiverse: judge this thread. Use no tools. Answer with one JSON object on one line and nothing else:',
   '{"summary": "<2-3 sentences: what this thread is about and where it stands>",',
   ' "topics": ["<3-6 short lowercase tags>"],',
   ' "project": "<a short, stable name for the project or body of work this thread belongs to>",',
@@ -67,8 +67,8 @@ export function parseVerdict(text: string): JudgeVerdict | null {
   }
 }
 
-// With no judge (keep-warm off, or the fork unavailable), the entry carries what the transcript
-// itself says: the first prompt and the last answer, clipped. Costs nothing.
+// With no judge (the fork unavailable, or a /clear that left no time for one), the entry carries
+// what the transcript itself says: the first prompt and the last answer, clipped. Costs nothing.
 export function localVerdict(messages: readonly { role: 'user' | 'assistant'; text: string }[]): JudgeVerdict {
   const first = plainText(messages.find(m => m.role === 'user' && isPersonText(m.text))?.text ?? '')
   const last = plainText([...messages].reverse().find(m => m.role === 'assistant' && m.text.trim() !== '')?.text ?? '')
@@ -354,7 +354,7 @@ export function renderMarkdown(manifest: Manifest, orphans: readonly ProjectArch
   const lines = [
     '# Open threads',
     '',
-    `Written by Judge Keep Warm at ${manifest.generatedAt}. One section per project; resume a thread with its command on the machine and account it names. Threads merged or deleted out of a project are kept, one line each, in its sub-manifest under \`${ARCHIVE_DIR}/\`.`,
+    `Written by Judgeiverse at ${manifest.generatedAt}. One section per project; resume a thread with its command on the machine and account it names. Threads merged or deleted out of a project are kept, one line each, in its sub-manifest under \`${ARCHIVE_DIR}/\`.`,
     '',
   ]
   const count = (p: ManifestProject, s: ManifestThread['status']) => p.threads.filter(t => t.status === s).length

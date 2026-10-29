@@ -133,6 +133,9 @@ function engine(on: Parameters<Parameters<typeof test>[1]>[1], files: Record<str
   on('settings.read', () => ({ value: {} }))
   on('tool.call', () => ({ result: {}, isError: true, text: 'no such tool' }))
   on('classic.SessionStart', () => ({}))
+  on('turn.start', (_, e) => ({ turnId: e.turnId }))
+  on('turn.complete', (_, e) => ({ text: e.answer }))
+  on('session.end', (_, e) => ({ sessionId: e.sessionId }))
   on('ui.toast', (_, e) => {
     toasts.push(e.text)
     return { value: undefined }
@@ -177,7 +180,7 @@ const PANE = {
   plugin: 'judge-keep-warm',
   component: 'Pane',
   requestId: 'judgeiverse',
-  props: { title: 'Judgeiverse keep warm', isFocused: false, bodyColumns: 60, placement: 'dock', scroll: { offset: 0, bodyRows: 40 }, view: {} },
+  props: { title: 'Judgeiverse', isFocused: false, bodyColumns: 60, placement: 'dock', scroll: { offset: 0, bodyRows: 40 }, view: {} },
 } as const
 
 const BAND = {
@@ -307,8 +310,8 @@ test('the pane draws a status card and compact thread rows on every surface, and
     const ui = await $.ui.mount({ ...PANE, surface })
     expect((await ui.find({ type: 'Text', text: /^Judgeiverse$/ }))?.text).toBe('Judgeiverse')
     expect((await ui.find({ type: 'Text', text: /^v\d/ }))?.text).toBe(`v${RELEASE}`)
-    // The cache bar is a drawing where the surface takes one, cells on the terminal.
-    expect((await ui.find({ type: 'Svg' })) === undefined).toBe(surface === 'terminal')
+    // No cache bar: keeping the cache warm is another mod's job.
+    expect(await ui.find({ type: 'Svg' })).toBe(undefined)
     expect((await ui.find({ type: 'Text', text: /open threads? in/ }))?.text).toContain('2 open threads in 1 project · read ')
     expect((await ui.find({ key: 'view-project' }))?.props['label']).toBe('This project · 2')
     expect((await ui.find({ key: `open:${KEEP}` }))?.text).toBe('▸ Keep me')
@@ -378,16 +381,17 @@ test('/judge pane opens the pane, and a thread merged away is not filed again', 
   expect(repo.commits.length).toBe(0)
 })
 
-test('a failed filing is tried once per cache expiry, not on every tick', { options: OPTIONS }, async ($, on) => {
+test('a failed filing is tried once per pause, not on every tick', { options: OPTIONS }, async ($, on) => {
   const clock = mock.clock(on, { now: START })
   mock.store(on)
   const { repo } = engine(on, repoFiles(THREADS.slice(0, 1)))
   repo.failing = true
 
   await $.session.start({ cwd: '/work/app', surface: 'desktop', isInteractive: true })
-  // Reopened 50 minutes after its last answer: about 7 minutes of a 1-hour cache are left.
-  await $.classic.SessionStart({ source: 'resume', seconds_since_last_response: 50 * 60, context_tokens: 120_000 })
-  await clock.advance(4 * 60_000)
+  await $.turn.start({ text: 'Port it', turnId: 't1' })
+  const usage = { input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 1, cache_creation_input_tokens: 0, model: 'opus' }
+  await $.turn.complete({ answer: 'Ported.', durationMs: 1000, isAborted: false, turnId: 't1', reason: 'answer', usage })
+  await clock.advance(2 * 60_000 + 15_000)
   const afterFirst = repo.fetches
   expect(afterFirst).toBeGreaterThan(0)
   await clock.advance(2 * 60_000)
@@ -474,6 +478,10 @@ test('this session\'s own row is marked in the pane', { options: OPTIONS }, asyn
 
   await $.session.start({ cwd: '/work/app', surface: 'desktop', isInteractive: true })
   await clock.advance(1)
+  // Filed by an earlier process: the line says so, not "not filed yet".
+  const band = await $.ui.mount({ ...BAND, surface: 'desktop' })
+  expect((await band.find({ type: 'Text', text: /^in the manifest$/ }))?.text).toBe('in the manifest')
+  await band.unmount()
   for (const surface of ['terminal', 'desktop', 'mobile'] as const) {
     const ui = await $.ui.mount({ ...PANE, surface })
     expect((await ui.find({ key: 'open:sess-1' }))?.text).toBe('▸ Port the billing job  this thread')

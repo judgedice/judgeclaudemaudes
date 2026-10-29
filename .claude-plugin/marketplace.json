@@ -1,6 +1,6 @@
 {
   "name": "judge-keep-warm",
-  "description": "Judge Keep Warm, a Claude Code mod: keep-warm pings plus a GitHub manifest of your open threads, bundled into projects by the mod itself",
+  "description": "Judgeiverse, a Claude Code mod: a GitHub manifest of your threads, filed after each turn and bundled into projects by the mod itself",
   "owner": {
     "name": "Marvin Di Cesaro",
     "url": "https://github.com/judgedice"
@@ -9,7 +9,7 @@
     {
       "name": "judge-keep-warm",
       "source": "./",
-      "description": "Keeps the prompt cache warm and files threads about to go cold into a GitHub manifest it bundles into projects, through your own Claude Code connection"
+      "description": "Files each thread into a GitHub manifest once the conversation pauses, and bundles the manifest into projects through your own Claude Code connection, so you resume threads from any machine"
     }
   ]
 }

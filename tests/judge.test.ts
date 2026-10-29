@@ -85,13 +85,14 @@ test('the line draws on every surface with the judge part', { options: OPTIONS }
 
   for (const surface of ['terminal', 'desktop'] as const) {
     const ui = await $.ui.mount({ ...BAND, surface })
-    const row = await ui.find({ type: 'Text', text: /nothing cached yet/ })
-    expect(row?.text).toBe('nothing cached yet')
+    // Nothing filed yet, and nothing due before a turn.
+    const row = await ui.find({ type: 'Text', text: /not filed yet/ })
+    expect(row?.text).toBe('not filed yet')
     // The line's name leads it, on every surface.
     const label = await ui.find({ type: 'Text', text: /Judgeiverse/ })
     expect(label?.text).toBe('Judgeiverse')
     // Nothing filed and no manifest read yet: no counter, no flash.
-    expect(await ui.find({ type: 'Text', text: /filed|manifest updated/ })).toBe(undefined)
+    expect(await ui.find({ type: 'Text', text: /^filed |manifest updated/ })).toBe(undefined)
     await ui.unmount()
   }
 })
@@ -103,7 +104,7 @@ const MESSAGES = [
 
 // Stands for the engine beneath the mod, with a small GitHub in memory: one branch, a tree of
 // files, blobs by sha. Records every commit's files.
-type Repo = { files: Record<string, string>; commits: { message: string; files: Record<string, string> }[]; modelCalls: number }
+type Repo = { files: Record<string, string>; commits: { message: string; files: Record<string, string> }[]; modelCalls: number; toasts?: string[] }
 
 function fakeGithub(repo: Repo) {
   const blobs = new Map<string, string>()
@@ -159,14 +160,15 @@ function fakeGithub(repo: Repo) {
   }
 }
 
-// `panes`, when given, records every pane the mod opens and places it; without it, no surface places panes.
-function engine(on: Parameters<Parameters<typeof test>[1]>[1], startedAt: number, repo: Repo, panes?: string[]) {
+// `panes`, when given, records every pane the mod opens and places it; without it, no surface places
+// panes. `ids.current` is the session's id, which a /clear changes.
+function engine(on: Parameters<Parameters<typeof test>[1]>[1], startedAt: number, repo: Repo, panes?: string[], ids = { current: 'sess-1' }) {
   const github = fakeGithub(repo)
   mock.env(on, { HOSTNAME: 'mac.local', USER: 'me' })
   on('command.register', (_, e) => ({ value: { command: e.name } }))
   on('session.start', (_, e) => ({ cwd: e.cwd }))
   on('session.usage', () => ({ value: { startedAt, context: { tokens: 120_000, window: 1_000_000 }, rateLimits: [{ kind: 'five_hour', percentUsed: 10 }], cost: {} } }))
-  on('session.id', () => ({ value: 'sess-1' }))
+  on('session.id', () => ({ value: ids.current }))
   on('session.repo', () => ({ value: { root: '/work/app', remote: 'git@github.com:me/app.git', internal: false, name: null } }))
   on('session.cwd', () => ({ value: '/work/app' }))
   on('session.model', () => ({ value: 'opus' }))
@@ -176,7 +178,13 @@ function engine(on: Parameters<Parameters<typeof test>[1]>[1], startedAt: number
   on('settings.read', () => ({ value: {} }))
   on('tool.call', () => ({ result: {}, isError: true, text: 'no such tool' }))
   on('classic.SessionStart', () => ({}))
-  on('ui.toast', () => ({ value: undefined }))
+  on('turn.start', (_, e) => ({ turnId: e.turnId }))
+  on('turn.complete', (_, e) => ({ text: e.answer }))
+  on('session.end', (_, e) => ({ sessionId: e.sessionId }))
+  on('ui.toast', (_, e) => {
+    repo.toasts?.push(e.text)
+    return { value: undefined }
+  })
   on('ui.open', (_, e) => {
     if (!panes) return { value: { isPlaced: false, reason: 'no surface places panes' } }
     panes.push(e.id)
@@ -212,25 +220,47 @@ const OTHER_THREAD = JSON.stringify({
   summary: 'Started with: tests', topics: [], project: '', nextStep: '', resume: 'claude --resume s-other',
 })
 
-test('with keep-warm off, the thread is filed locally when 5 minutes of the cache are left', { options: OPTIONS }, async ($, on) => {
+const USAGE = { input_tokens: 10, output_tokens: 50, cache_read_input_tokens: 120_000, cache_creation_input_tokens: 500, model: 'opus' }
+
+const VERDICT_TEXT = '{"summary": "Porting the billing job to the queue; the worker is done.", "topics": ["billing"], "project": "App billing", "nextStep": "run the migration", "isDone": false}'
+
+test('after a turn, the thread is judged and filed once the conversation pauses, and again only after another turn', { options: OPTIONS }, async ($, on) => {
   const start = 1_700_000_000_000
   const clock = mock.clock(on, { now: start })
   mock.store(on)
   const repo = engine(on, start, { files: { 'README.md': 'hi', 'threads/home/s-other.json': OTHER_THREAD }, commits: [], modelCalls: 0 })
+  let forks = 0
+  on('model.fork', () => {
+    forks++
+    return { value: { isAnswered: true, text: VERDICT_TEXT, usage: { input_tokens: 10, output_tokens: 40, cache_read_input_tokens: 120_000, cache_creation_input_tokens: 0 } } }
+  })
+  const turn = async (turnId: string) => {
+    await $.turn.start({ text: 'Go on', turnId })
+    await $.turn.complete({ answer: 'Done.', durationMs: 1000, isAborted: false, turnId, reason: 'answer', usage: USAGE })
+  }
 
   await $.session.start({ cwd: '/work/app', surface: 'desktop', isInteractive: true })
-  // The session was reopened 50 minutes after its last answer: the cache has ~7 minutes left.
-  await $.classic.SessionStart({ source: 'resume', seconds_since_last_response: 50 * 60, context_tokens: 120_000 })
+  // Nothing is filed at start, however long the session has been idle.
+  await clock.advance(10 * 60_000)
+  expect(repo.commits.length).toBe(0)
+
+  await turn('t1')
+  const band = await $.ui.mount({ ...BAND, surface: 'terminal' })
+  expect((await band.find({ type: 'Text', text: /^files at / }))?.text).toBe(`files at ${hhmm(clock.now() + 2 * 60_000)}`)
+  await band.unmount()
   await clock.advance(60_000)
   expect(repo.commits.length).toBe(0)
 
-  // Three minutes on: inside the last 5 minutes, so the thread is filed, once, with the manifest
-  // bundled over it and the thread another machine filed.
-  await clock.advance(3 * 60_000)
+  // Two minutes after the turn, with none since: judged by a fork and filed, once, with the
+  // manifest bundled over it and the thread another machine filed.
+  await clock.advance(75_000)
+  expect(forks).toBe(1)
   const filed = filedEntries(repo)
   expect(filed.length).toBe(1)
   expect(filed[0]?.path).toBe('threads/work/sess-1.json')
-  expect(filed[0]?.entry.filedBy).toBe('local')
+  expect(filed[0]?.entry.filedBy).toBe('judge')
+  expect(filed[0]?.entry.summary).toBe('Porting the billing job to the queue; the worker is done.')
+  expect(filed[0]?.entry.project).toBe('App billing')
   // Both threads run in me/app: bundled by repository, nothing for the model to place.
   expect(repo.modelCalls).toBe(0)
   expect(filed[0]?.manifest.projects.map(p => p.name)).toEqual(['app'])
@@ -241,9 +271,102 @@ test('with keep-warm off, the thread is filed locally when 5 minutes of the cach
   expect(filed[0]?.entry.account).toBe('work')
   expect(filed[0]?.entry.host).toBe('mac')
   expect(filed[0]?.entry.title).toBe('Port the billing job to the queue')
-  expect(filed[0]?.entry.summary).toBe('Started with: Port the billing job to the queue Last answer: The worker is written; the migration is next.')
   expect(filed[0]?.entry.resume).toBe('claude --resume sess-1')
+  const entry = JSON.parse(repo.files['threads/work/sess-1.json']!) as { keepWarm: boolean; cacheExpiresAt: string; lastActiveAt: string }
+  expect(entry.keepWarm).toBe(false)
+  expect(entry.cacheExpiresAt).toBe('')
 
+  // An hour on with no turn: nothing to file again.
+  await clock.advance(60 * 60_000)
+  expect(repo.commits.length).toBe(1)
+  expect(forks).toBe(1)
+
+  await turn('t2')
+  await clock.advance(2 * 60_000 + 15_000)
+  expect(repo.commits.length).toBe(2)
+  expect(forks).toBe(2)
+})
+
+test('a turn started before the pause holds the filing until the pause after it', { options: OPTIONS }, async ($, on) => {
+  const start = 1_700_000_000_000
+  const clock = mock.clock(on, { now: start })
+  mock.store(on)
+  const repo = engine(on, start, { files: { 'README.md': 'hi' }, commits: [], modelCalls: 0 })
+  on('model.fork', () => ({ value: { isAnswered: true, text: VERDICT_TEXT, usage: { input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 1, cache_creation_input_tokens: 0 } } }))
+
+  await $.session.start({ cwd: '/work/app', surface: 'desktop', isInteractive: true })
+  await $.turn.start({ text: 'Port it', turnId: 't1' })
+  await $.turn.complete({ answer: 'Ported.', durationMs: 1000, isAborted: false, turnId: 't1', reason: 'answer', usage: USAGE })
+  await clock.advance(90_000)
+  // The next turn starts before the two minutes are up and runs past them.
+  await $.turn.start({ text: 'Now the migration', turnId: 't2' })
+  await clock.advance(3 * 60_000)
+  expect(repo.commits.length).toBe(0)
+  await $.turn.complete({ answer: 'Migrated.', durationMs: 1000, isAborted: false, turnId: 't2', reason: 'answer', usage: USAGE })
+  await clock.advance(60_000)
+  expect(repo.commits.length).toBe(0)
+  await clock.advance(75_000)
+  expect(repo.commits.length).toBe(1)
+})
+
+test('with filing off, a turn files nothing; /judge file still does', { options: { ...OPTIONS, file_threads: false } }, async ($, on) => {
+  const start = 1_700_000_000_000
+  const clock = mock.clock(on, { now: start })
+  mock.store(on)
+  const repo = engine(on, start, { files: { 'README.md': 'hi' }, commits: [], modelCalls: 0 })
+  on('model.fork', () => ({ value: { isAnswered: true, text: VERDICT_TEXT, usage: { input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 1, cache_creation_input_tokens: 0 } } }))
+
+  await $.session.start({ cwd: '/work/app', surface: 'desktop', isInteractive: true })
+  await $.turn.start({ text: 'Port it', turnId: 't1' })
+  await $.turn.complete({ answer: 'Ported.', durationMs: 1000, isAborted: false, turnId: 't1', reason: 'answer', usage: USAGE })
+  await clock.advance(10 * 60_000)
+  expect(repo.commits.length).toBe(0)
+  const band = await $.ui.mount({ ...BAND, surface: 'desktop' })
+  expect((await band.find({ type: 'Text', text: /^files on / }))?.text).toBe('files on /judge file')
+  await band.unmount()
+
+  await $.command.run({ command: 'judge', args: 'file' })
+  expect(repo.commits.length).toBe(1)
+})
+
+test('a /clear before the pause files the thread it ends, from its transcript, with no fork', { options: OPTIONS }, async ($, on) => {
+  const start = 1_700_000_000_000
+  const clock = mock.clock(on, { now: start })
+  mock.store(on)
+  const ids = { current: 'sess-1' }
+  const toasts: string[] = []
+  const repo = engine(on, start, { files: { 'README.md': 'hi' }, commits: [], modelCalls: 0, toasts }, undefined, ids)
+  let forks = 0
+  on('model.fork', () => {
+    forks++
+    return { value: { isAnswered: true, text: VERDICT_TEXT, usage: { input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 1, cache_creation_input_tokens: 0 } } }
+  })
+
+  await $.session.start({ cwd: '/work/app', surface: 'desktop', isInteractive: true })
+  await $.turn.start({ text: 'Port it', turnId: 't1' })
+  await $.turn.complete({ answer: 'Ported.', durationMs: 1000, isAborted: false, turnId: 't1', reason: 'answer', usage: USAGE })
+  await clock.advance(30_000)
+
+  await $.session.end({ reason: 'clear', sessionId: 'sess-1', resume: { id: 'sess-1' } })
+  ids.current = 'sess-2'
+  await $.classic.SessionStart({ source: 'clear' })
+  // The next tick commits it.
+  await clock.advance(15_000)
+
+  const filed = filedEntries(repo)
+  expect(filed.length).toBe(1)
+  expect(filed[0]?.path).toBe('threads/work/sess-1.json')
+  expect(filed[0]?.entry.filedBy).toBe('end')
+  expect(filed[0]?.entry.summary).toBe('Started with: Port the billing job to the queue Last answer: The worker is written; the migration is next.')
+  expect(forks).toBe(0)
+  expect(toasts).toContain('Judge: the thread before the clear was created in me/claude-threads.')
+
+  // Past the commit's flash, the new conversation shows nothing filed and nothing due, and the
+  // old thread is not filed again.
+  await clock.advance(8_001)
+  const band = await $.ui.mount({ ...BAND, surface: 'desktop' })
+  expect((await band.find({ type: 'Text', text: /^not filed yet$/ }))?.text).toBe('not filed yet')
+  await band.unmount()
   await clock.advance(5 * 60_000)
   expect(repo.commits.length).toBe(1)
 })
@@ -268,7 +391,7 @@ test('/judge file asks the fork for a verdict and files it', { options: OPTIONS 
   await $.session.start({ cwd: '/work/app', surface: 'desktop', isInteractive: true })
   const { text } = await $.command.run({ command: 'judge', args: 'file' })
 
-  expect(prompt.startsWith('Judge Keep Warm ping.')).toBe(true)
+  expect(prompt.startsWith('Judgeiverse: judge this thread.')).toBe(true)
   expect(text).toContain('**Thread filed** at `threads/work/sess-1.json` in `me/claude-threads`; manifest bundled.')
   expect(text).toContain('- **Next:** run the migration')
   const filed = filedEntries(repo)
@@ -308,17 +431,17 @@ test('a filing lights the line with the manifest update, then the tally stays', 
     expect((await ui.find({ type: 'Text', text: /^\d+ threads?$/ }))?.text).toBe('2 threads')
     expect((await ui.find({ type: 'Text', text: /^\d+ projects?$/ }))?.text).toBe('1 project')
     expect((await ui.find({ type: 'Text', text: /^\d+ updates?$/ }))?.text).toBe('1 update')
-    // While lit, the dim "manifest updated HH:MM" part gives way to the flash.
-    expect(await ui.find({ type: 'Text', text: /^manifest updated / })).toBe(undefined)
+    // While lit, where the thread stands gives way to the flash.
+    expect(await ui.find({ type: 'Text', text: /^filed / })).toBe(undefined)
     await ui.unmount()
   }
 
-  // Past the flash, the line goes back to dim: the flash is gone, the tally stays.
+  // Past the flash, the line says when the thread was filed: the flash is gone, the tally stays.
   await clock.advance(8_001)
   for (const surface of ['terminal', 'desktop'] as const) {
     const ui = await $.ui.mount({ ...BAND, surface })
     expect(await ui.find({ type: 'Text', text: /^✓/ })).toBe(undefined)
-    expect((await ui.find({ type: 'Text', text: /^manifest updated / }))?.text).toBe(`manifest updated ${hhmm(start)}`)
+    expect((await ui.find({ type: 'Text', text: /^filed / }))?.text).toBe(`filed ${hhmm(start)}`)
     expect((await ui.find({ type: 'Text', text: /^\d+ updates?$/ }))?.text).toBe('1 update')
     expect((await ui.find({ type: 'Text', text: /Port the billing job/ }))?.text).toBe('Port the billing job to the queue')
     expect((await ui.find({ type: 'Text', text: /^\d+ threads?$/ }))?.text).toBe('2 threads')
@@ -363,7 +486,7 @@ const PANE = {
   plugin: 'judge-keep-warm',
   component: 'Pane',
   requestId: 'judgeiverse',
-  props: { title: 'Judgeiverse keep warm', isFocused: false, bodyColumns: 60, placement: 'dock', scroll: { offset: 0, bodyRows: 20 }, view: {} },
+  props: { title: 'Judgeiverse', isFocused: false, bodyColumns: 60, placement: 'dock', scroll: { offset: 0, bodyRows: 20 }, view: {} },
 } as const
 
 test('the pane draws the same line in rows, on every surface', { options: OPTIONS }, async ($, on) => {
@@ -377,7 +500,7 @@ test('the pane draws the same line in rows, on every surface', { options: OPTION
   for (const surface of ['terminal', 'desktop'] as const) {
     const ui = await $.ui.mount({ ...PANE, surface })
     expect((await ui.find({ type: 'Text', text: /Judgeiverse/ }))?.text).toBe('Judgeiverse')
-    expect((await ui.find({ type: 'Text', text: /nothing cached yet/ }))?.text).toBe('nothing cached yet')
+    expect((await ui.find({ type: 'Text', text: /not filed yet/ }))?.text).toBe('not filed yet')
     expect((await ui.find({ type: 'Button', text: /File now/ }))?.text).toBe('File now')
     await ui.unmount()
   }
