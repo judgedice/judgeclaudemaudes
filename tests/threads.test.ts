@@ -2,8 +2,9 @@ import { expect, mock, test } from 'claude-code/testing'
 
 import { mdText, threadsReply } from '../hooks/format'
 import { briefOf, buildOf, fromBase64, toBase64 } from '../hooks/judge'
+import { guardTidy, parseTidy, protectedIds, stillValid, tidyRefs, tidyRules, titleKey } from '../hooks/tidy'
 import { RELEASE } from '../hooks/version'
-import type { Manifest, ManifestThread, ProjectArchive } from '../types'
+import type { Manifest, ManifestProject, ManifestThread, ProjectArchive } from '../types'
 
 const OPTIONS = { manifest_repo: 'me/claude-threads', account_label: 'work', github_token: 'ghp_test', file_threads: true }
 const START = 1_700_000_000_000
@@ -48,7 +49,7 @@ function repoFiles(threads: Thread[], without: string[] = []) {
 }
 
 type Commit = { message: string; files: Record<string, string>; deletes: string[] }
-type Repo = { files: Record<string, string>; commits: Commit[]; modelCalls: number; fetches: number; failing: boolean }
+type Repo = { files: Record<string, string>; commits: Commit[]; modelCalls: number; fetches: number; failing: boolean; tidyPrompts: string[] }
 
 // GitHub in memory: one branch, a tree of files, blobs by sha; a tree entry with a null sha deletes its path.
 function fakeGithub(repo: Repo) {
@@ -109,18 +110,20 @@ function fakeGithub(repo: Repo) {
   }
 }
 
-type Extra = { env?: Record<string, string>; local?: string[]; version?: string; sessionId?: string; noPanes?: boolean }
+// `tidyAnswer`: what the model answers the tidy review (its system prompt starts "You tidy"); null: no answer.
+type Extra = { env?: Record<string, string>; local?: string[]; version?: string; sessionId?: string; noPanes?: boolean; tidyAnswer?: string | null }
 const PROJECTS_DIR = '/home/me/.claude/projects'
 
 // Stands for the engine beneath the mod. `local` lists the session ids whose transcripts this
 // machine keeps under PROJECTS_DIR; without it there is no such folder.
 function engine(on: Parameters<Parameters<typeof test>[1]>[1], files: Record<string, string>, extra: Extra = {}) {
-  const repo: Repo = { files, commits: [], modelCalls: 0, fetches: 0, failing: false }
+  const repo: Repo = { files, commits: [], modelCalls: 0, fetches: 0, failing: false, tidyPrompts: [] }
   const github = fakeGithub(repo)
   const toasts: string[] = []
   const opened: string[] = []
   mock.env(on, { HOSTNAME: 'mac.local', USER: 'me', ...(extra.local ? { HOME: '/home/me' } : {}), ...(extra.env ?? {}) })
   on('command.register', (_, e) => ({ value: { command: e.name } }))
+  on('tool.register', (_, e) => ({ value: { tool: `mcp__judge-keep-warm__${e.name}` } }))
   on('session.start', (_, e) => ({ cwd: e.cwd }))
   on('session.usage', () => ({ value: { startedAt: START, context: { tokens: 120_000, window: 1_000_000 }, rateLimits: [{ kind: 'five_hour', percentUsed: 10 }], cost: { usd: 0 } } }))
   on('session.id', () => ({ value: extra.sessionId ?? 'sess-1' }))
@@ -159,8 +162,14 @@ function engine(on: Parameters<Parameters<typeof test>[1]>[1], files: Record<str
     if (e.path === `${PROJECTS_DIR}/-work-app`) return { value: (extra.local ?? []).map(id => file(`${id}.jsonl`, 'file')) }
     return { value: [] }
   })
-  on('model.complete', () => {
+  on('model.complete', (_, e) => {
     repo.modelCalls++
+    if (e.system?.startsWith('You tidy')) {
+      repo.tidyPrompts.push(e.prompt)
+      const answer = extra.tidyAnswer ?? null
+      const usage = { input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 }
+      return { value: answer === null ? { isAnswered: false, reason: 'empty-reply', usage } : { isAnswered: true, text: answer, usage } }
+    }
     return { value: { isAnswered: true, text: `{"projects": [{"name": "App", "description": "The app and its queue.", "threadIds": ["sess-1", "${KEEP}", "${DROP}", "${MINE}", "${ELSEWHERE}"]}]}`, usage: { input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 } } }
   })
   on('model.fork', () => ({
@@ -488,4 +497,205 @@ test('this session\'s own row is marked in the pane', { options: OPTIONS }, asyn
     expect((await ui.find({ type: 'Text', text: /^work · Porting/ }))?.text).toBe('work · Porting the billing job to the queue.')
     await ui.unmount()
   }
+})
+
+// ---- Tidying ------------------------------------------------------------------------------------
+
+// Three days after the threads' last activity: none of them is protected by being recent.
+const LATER = Date.parse('2023-11-17T20:00:00.000Z')
+const TIDY_ANSWER = '```json\n{"merge": [{"keep": "t1", "drop": ["t2"], "reason": "Both work on the queue"}], "archive": [{"id": "t3", "reason": "The release notes are drafted"}]}\n```'
+
+function project(slug: string, threads: Partial<ManifestThread>[]): ManifestProject {
+  return {
+    name: slug, slug, description: '', repos: [],
+    threads: threads.map((t, i) => ({ sessionId: `${slug}-${i}`, account: 'a', host: 'h', title: `T${i}`, summary: 'Some work.', repo: null, cwd: '/x', lastActiveAt: '2023-11-10T00:00:00.000Z', status: 'open', resume: '', ...t })),
+  }
+}
+
+test('the rules fold same-titled threads into the newest and archive empty, done and stale ones', async () => {
+  expect(titleKey('🛞 DFY Hub')).toBe('dfy hub')
+  expect(titleKey('DFY HUB')).toBe('dfy hub')
+  expect(titleKey('Odoo profile setup (fork)')).toBe('odoo profile setup')
+  expect(titleKey('This session is being continued from a previous conversation that ran out')).toBe('')
+
+  const projects = [
+    project('hub', [
+      { title: 'DFY HUB', lastActiveAt: '2023-11-12T00:00:00.000Z' },
+      { title: '🛞 DFY Hub', lastActiveAt: '2023-11-13T00:00:00.000Z' },
+      { title: 'This session is being continued from a previous conversation' },
+      { title: 'This session is being continued from a previous conversation' },
+      { title: 'Old', status: 'stale', lastActiveAt: '2023-10-20T00:00:00.000Z' },
+      { title: 'Done', status: 'closed' },
+      { title: 'Empty', summary: 'No messages yet.' },
+    ]),
+    // The same title in another project is other work.
+    project('site', [{ title: 'DFY HUB' }]),
+  ]
+  const refs = tidyRefs(projects)
+  const rules = tidyRules(refs, LATER)
+  expect(rules.merge).toEqual([{ keep: 't2', drop: ['t1'], reason: 'Same title: “🛞 DFY Hub”' }])
+  expect(rules.archive.map(a => [a.id, a.reason])).toEqual([['t5', 'Idle for 28 days'], ['t6', 'The judge marked it done'], ['t7', 'Empty: nothing was said in it']])
+})
+
+test('the guards keep protected threads listed, merge within one project, and use each thread once', async () => {
+  const projects = [
+    project('hub', [
+      { lastActiveAt: '2023-11-17T19:00:00.000Z' }, // t1: an hour ago, protected
+      {}, // t2
+      {}, // t3
+      { sessionId: 'self' }, // t4: this session
+    ]),
+    project('site', [{}]), // t5
+  ]
+  const refs = tidyRefs(projects)
+  const guard = protectedIds(projects, 'self', LATER)
+  expect([...guard].sort()).toEqual(['hub-0', 'self'])
+
+  const { proposals, skipped } = guardTidy(
+    {
+      merge: [
+        // The model kept t2, but t1 may be running now: t1 is the one kept.
+        { keep: 't2', drop: ['t1', 't5', 'nope'], reason: 'Same work' },
+        // t2 is in the step above already.
+        { keep: 't3', drop: ['t2'], reason: 'Again' },
+      ],
+      archive: [{ id: 't4', reason: 'Done' }, { id: 't3', reason: 'Done' }, { id: 't2', reason: 'Done' }],
+    },
+    refs,
+    guard,
+  )
+  expect(proposals).toEqual([
+    { id: 'merge:hub-0', kind: 'merge', keep: 'hub-0', drop: ['hub-1'], reason: 'Same work', project: 'hub' },
+    { id: 'archive:hub-2', kind: 'archive', drop: ['hub-2'], reason: 'Done', project: 'hub' },
+  ])
+  expect(skipped.map(s => [s.ref, s.why.split(':')[0]])).toEqual([
+    ['t5', 'in another project (site); threads merge only within one'],
+    ['nope', 'no such thread'],
+    ['t2', 'already in another step'],
+    ['t4', 'protected'],
+  ])
+
+  expect(parseTidy('Sure! Here it is.')).toBe(null)
+  expect(parseTidy('{"projects": []}')).toBe(null)
+  expect(parseTidy(TIDY_ANSWER)?.merge).toEqual([{ keep: 't1', drop: ['t2'], reason: 'Both work on the queue' }])
+
+  // A step whose threads left the manifest since the review drops out; the rest still apply.
+  // Only hub-0 is still listed: the merge has nothing left to fold in, the archived thread is gone.
+  const now = stillValid(proposals, [project('hub', [{}])])
+  expect(now).toEqual({ merges: [], remove: [], dropped: 2 })
+  const kept = stillValid(proposals, projects)
+  expect(kept).toEqual({ merges: [{ keep: 'hub-0', drop: ['hub-1'] }], remove: ['hub-2'], dropped: 0 })
+})
+
+test('/judge tidy reviews the threads through the model, and /judge tidy apply commits every step at once', { options: OPTIONS }, async ($, on) => {
+  mock.clock(on, { now: LATER })
+  mock.store(on)
+  const { repo } = engine(on, repoFiles(THREADS), { tidyAnswer: TIDY_ANSWER })
+
+  await $.session.start({ cwd: '/work/app', surface: 'desktop', isInteractive: true })
+  const review = await $.command.run({ command: 'judge', args: 'tidy' })
+  expect(review.text).toContain('**Tidy:** reviewed 4 threads, 2 steps proposed.')
+  expect(review.text).toContain('1. **Merge** into **Keep me** · *app*\n   - ~~Fold me~~\n   Both work on the queue')
+  expect(review.text).toContain('2. **Archive** **Old thread on this mac** · *app*\n   The release notes are drafted')
+  // The model sees short names, never session ids, and the rules' finds as hints.
+  expect(repo.tidyPrompts[0]).toContain('"id":"t1","title":"Keep me"')
+  expect(repo.tidyPrompts[0]).not.toContain(KEEP)
+  expect(repo.commits.length).toBe(0)
+
+  const applied = await $.command.run({ command: 'judge', args: 'tidy apply' })
+  expect(applied.text).toContain('**Tidied: merged 1 thread into 1 kept thread, archived 1 thread.')
+  expect(applied.text).toContain('The manifest now lists 2 threads in 1 project.')
+  expect(repo.commits.length).toBe(1)
+  expect(repo.commits[0]?.message).toBe('judge: merge 1 thread into Keep me; delete Old thread on this mac; 2 threads in 1 projects')
+  expect(repo.commits[0]?.deletes.sort()).toEqual([`threads/home/${DROP}.json`, `threads/work/${MINE}.json`].sort())
+  expect(archiveOf(repo, 'me-app').threads.map(a => [a.sessionId, a.reason, a.into ?? ''])).toEqual([[DROP, 'merged', KEEP], [MINE, 'deleted', '']])
+  expect(manifestOf(repo).projects[0]?.threads.map(t => t.sessionId).sort()).toEqual([KEEP, ELSEWHERE].sort())
+  // One model call for the review, none for the commit: the other threads stay where they were.
+  expect(repo.modelCalls).toBe(1)
+
+  const again = await $.command.run({ command: 'judge', args: 'tidy apply' })
+  expect(again.text).toBe('**Tidy:** no review to apply. `/judge tidy` makes one.')
+})
+
+test('with no model answer the tidy falls back to the rules, and a numbered step applies alone', { options: OPTIONS }, async ($, on) => {
+  mock.clock(on, { now: LATER })
+  mock.store(on)
+  const twin: Thread = { id: 'eeee5555-0000-4000-8000-000000000005', account: 'home', host: 'pc', title: 'Keep me (fork)', summary: 'Started with: Fix the queue retries' }
+  const { repo } = engine(on, repoFiles([...THREADS.slice(0, 2), twin]), { tidyAnswer: null })
+
+  await $.session.start({ cwd: '/work/app', surface: 'desktop', isInteractive: true })
+  const review = await $.command.run({ command: 'judge', args: 'tidy' })
+  expect(review.text).toContain("The model gave no answer, so these are the rules' finds alone")
+  expect(review.text).toContain('1. **Merge** into **Keep me**')
+  expect(review.text).toContain('~~Keep me (fork)~~')
+
+  const bad = await $.command.run({ command: 'judge', args: 'tidy apply 4' })
+  expect(bad.text).toBe('**Tidy:** name steps by their numbers, 1 to 1.')
+  await $.command.run({ command: 'judge', args: 'tidy apply 1' })
+  expect(repo.commits.length).toBe(1)
+  expect(archiveOf(repo, 'me-app').threads.map(a => a.sessionId)).toEqual([twin.id])
+})
+
+test('the pane reviews on Tidy up, and applies only the steps left ticked', { options: OPTIONS }, async ($, on) => {
+  const clock = mock.clock(on, { now: LATER })
+  mock.store(on)
+  const { repo } = engine(on, repoFiles(THREADS), { tidyAnswer: TIDY_ANSWER })
+
+  await $.session.start({ cwd: '/work/app', surface: 'desktop', isInteractive: true })
+  await clock.advance(1)
+
+  for (const surface of ['terminal', 'desktop', 'mobile'] as const) {
+    const ui = await $.ui.mount({ ...PANE, surface })
+    expect(await ui.find({ key: 'tidy' })).toBeDefined()
+    expect(await ui.find({ key: 'tidy-apply' })).toBe(undefined)
+    await ui.unmount()
+  }
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await ui.press({ key: 'tidy' })
+  expect((await ui.find({ type: 'Text', text: /steps? · \d+ threads? reviewed/ }))?.text).toBe('2 steps · 4 threads reviewed')
+  expect((await ui.find({ key: `tidy-pick:merge:${KEEP}` }))?.text).toBe('☑ Merge 1 into “Keep me”')
+  expect((await ui.find({ key: `tidy-pick:archive:${MINE}` }))?.text).toBe('☑ Archive “Old thread on this mac”')
+  expect((await ui.find({ type: 'Text', text: /^app · Both/ }))?.text).toBe('app · Both work on the queue')
+  expect((await ui.find({ key: 'tidy-apply' }))?.props['label']).toBe('Apply 2')
+
+  await ui.press({ key: `tidy-pick:archive:${MINE}` })
+  expect((await ui.find({ key: `tidy-pick:archive:${MINE}` }))?.text).toBe('☐ Archive “Old thread on this mac”')
+  expect((await ui.find({ key: 'tidy-apply' }))?.props['label']).toBe('Apply 1')
+  await ui.press({ key: 'tidy-apply' })
+
+  expect(repo.commits.length).toBe(1)
+  expect(archiveOf(repo, 'me-app').threads.map(a => [a.sessionId, a.reason])).toEqual([[DROP, 'merged']])
+  expect(manifestOf(repo).projects[0]?.threads.map(t => t.sessionId).sort()).toEqual([KEEP, MINE, ELSEWHERE].sort())
+  expect((await ui.find({ type: 'Text', text: /^Tidied:/ }))?.text).toBe("Tidied: merged 1 thread into 1 kept thread. One line on each is kept in its project's sub-manifest.")
+  expect(await ui.find({ key: 'tidy-apply' })).toBe(undefined)
+  await ui.unmount()
+})
+
+test('the model lists the threads with list_threads and tidies them with tidy_threads, under the same guards', { options: OPTIONS }, async ($, on) => {
+  mock.clock(on, { now: LATER })
+  mock.store(on)
+  const own: Thread = { id: 'sess-1', account: 'work', host: 'mac', title: 'Port the billing job', summary: 'Porting the billing job.' }
+  const twin: Thread = { id: 'eeee5555-0000-4000-8000-000000000005', account: 'home', host: 'pc', title: 'Keep me', summary: 'Started with: Fix the queue retries' }
+  const { repo } = engine(on, repoFiles([...THREADS, own, twin]))
+
+  await $.session.start({ cwd: '/work/app', surface: 'desktop', isInteractive: true })
+  const listed = await $.tool.call({ tool: 'mcp__judge-keep-warm__list_threads' })
+  const text = String(listed.result)
+  expect(text).toContain('6 threads in 1 project. This session is sess-1.')
+  expect(text).toContain(`- ${KEEP} · Keep me · open · 3 days ago · home on pc`)
+  expect(text).toContain('- sess-1 · Port the billing job · open · 3 days ago · work on mac · protected')
+  expect(text).toContain(`- Merge 1 into “Keep me”: keep `)
+
+  const tidied = await $.tool.call({ tool: 'mcp__judge-keep-warm__tidy_threads', merge: [{ keep: KEEP.slice(0, 8), drop: [twin.id.slice(0, 8)] }], archive: ['sess-1', MINE] })
+  const done = String(tidied.result)
+  expect(done).toContain('Tidied: merged 1 thread into 1 kept thread, archived 1 thread.')
+  expect(done).toContain('Left alone:\n- sess-1 (Port the billing job): protected')
+  expect(done).toContain('The manifest now lists 4 threads in 1 project.')
+  expect(repo.commits.length).toBe(1)
+  expect(archiveOf(repo, 'me-app').threads.map(a => a.sessionId).sort()).toEqual([twin.id, MINE].sort())
+
+  const bad = await $.tool.call({ tool: 'mcp__judge-keep-warm__tidy_threads', archive: ['zz'] })
+  expect(String(bad.result)).toBe('Nothing changed: `zz` is too short to name a thread: give at least four characters of its session id.')
+  expect(repo.commits.length).toBe(1)
 })

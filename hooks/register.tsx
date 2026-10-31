@@ -19,9 +19,13 @@ import type {
   PaneEdit,
   ProjectArchive,
   ThreadEntry,
+  TidyPlan,
+  TidyProposal,
 } from '../types'
-import { ago, mdCode, mdText, pickMark, plural, shortAgo, summaryQuote, threadSubtitle, threadsReply } from './format'
+import { ago, mdCode, mdText, pickMark, plural, proposalLabel, shortAgo, summaryQuote, threadSubtitle, threadsReply, tidyDone, tidyReply } from './format'
 import type { Assignment } from './judge'
+import { RECENT_MS, guardTidy, parseTidy, pickedProposals, protectedIds, stillValid, tidyPrompt, tidyRefs, tidyRules } from './tidy'
+import type { RawTidy, TidyRef } from './tidy'
 import { RELEASE } from './version'
 import {
   ARCHIVE_DIR,
@@ -123,6 +127,15 @@ const FILED_BY: Record<ThreadEntry['filedBy'], string> = { judge: 'by the judge'
 const FIT_MARGIN = 4
 // How long a filing's outcome stays lit on the line before it goes back to dim.
 const FLASH_MS = 8000
+// The start-of-session notice suggests /judge tidy once this many open threads cover the project.
+const TIDY_NUDGE = 5
+// The tools the model calls to read the manifest and tidy it, listed as mcp__judge-keep-warm__<name>.
+const LIST_TOOL = 'list_threads'
+const TIDY_TOOL = 'tidy_threads'
+const LIST_TOOL_ID = 'mcp__judge-keep-warm__list_threads'
+const TIDY_TOOL_ID = 'mcp__judge-keep-warm__tidy_threads'
+// What list_threads shows of each summary.
+const TOOL_SUMMARY_MAX = 300
 
 const NOW = { plugin: 'judge-keep-warm', key: 'now' } as const
 const FILE_DUE = { plugin: 'judge-keep-warm', key: 'fileDueAt' } as const
@@ -148,6 +161,8 @@ const IS_BUSY = { plugin: 'judge-keep-warm', key: 'isBusy' } as const
 const SELF_ARCHIVED = { plugin: 'judge-keep-warm', key: 'selfArchived' } as const
 const PANE_OPEN_THREAD = { plugin: 'judge-keep-warm', key: 'paneOpenThread' } as const
 const PANE_OPEN_ARCHIVE = { plugin: 'judge-keep-warm', key: 'paneOpenArchive' } as const
+const TIDY_PLAN = { plugin: 'judge-keep-warm', key: 'tidyPlan' } as const
+const TIDY_OFF = { plugin: 'judge-keep-warm', key: 'tidyOff' } as const
 
 // The module's own variables start over on a reload; what must survive one is in $.state.
 const live: {
@@ -610,8 +625,8 @@ async function snapshotGit($: EngineInterface): Promise<Snapshot> {
 type Change = {
   /** This session's own entry, filed. */
   entry?: ThreadEntry
-  /** Fold `drop` into `keep`, all of one project. */
-  merge?: { keep: string; drop: string[] }
+  /** Each group: fold `drop` into `keep`, all of one project. */
+  merges?: { keep: string; drop: string[] }[]
   /** Take these threads out by hand. */
   remove?: string[]
   by: string
@@ -633,14 +648,15 @@ type Outcome = {
   self: ArchivedThread | null
 }
 
-function commitMessage(self: ThreadEntry | undefined, keepTitle: string, archived: readonly ArchivedThread[], threads: number, projects: number) {
+function commitMessage(self: ThreadEntry | undefined, keepTitles: readonly string[], archived: readonly ArchivedThread[], threads: number, projects: number) {
   const parts: string[] = []
   if (self) parts.push(`${self.status === 'closed' ? 'close' : 'file'} ${self.title.slice(0, 60)} (${self.account})`)
   const merged = archived.filter(a => a.reason === 'merged')
   const byHand = archived.filter(a => a.reason === 'deleted' && a.by !== TRANSCRIPT_GONE && a.by !== ENTRY_GONE)
   const cleared = archived.length - merged.length - byHand.length
-  if (merged.length) parts.push(`merge ${plural(merged.length, 'thread')} into ${keepTitle.slice(0, 60)}`)
-  if (byHand.length) parts.push(`delete ${byHand.map(a => a.title.slice(0, 40)).join(', ')}`)
+  if (merged.length) parts.push(`merge ${plural(merged.length, 'thread')} into ${keepTitles.length === 1 ? keepTitles[0]!.slice(0, 60) : plural(keepTitles.length, 'thread')}`)
+  if (byHand.length > 3) parts.push(`delete ${plural(byHand.length, 'thread')}`)
+  else if (byHand.length) parts.push(`delete ${byHand.map(a => a.title.slice(0, 40)).join(', ')}`)
   if (cleared) parts.push(`archive ${plural(cleared, 'deleted thread')}`)
   return `judge: ${parts.join('; ') || 'tidy'}; ${threads} threads in ${projects} projects`
 }
@@ -679,8 +695,7 @@ async function transact($: EngineInterface, change: Change): Promise<Outcome> {
       records.push({ record: archivedFrom(t, reason, by, at, into), entry: latest.get(t.sessionId) })
       return true
     }
-    if (change.merge) {
-      const { keep, drop } = change.merge
+    for (const { keep, drop } of change.merges ?? []) {
       if (!isListed(keep)) throw new Error(`the thread to keep (${keep.slice(0, 8)}) is not in the manifest any more`)
       const home = projectOf(snap.previous, keep)?.slug
       for (const id of drop) {
@@ -737,8 +752,8 @@ async function transact($: EngineInterface, change: Change): Promise<Outcome> {
     for (const a of changed) files.push({ path: archivePaths.get(a) ?? archivePath(a.slug), text: archiveJson(a) })
     files.push({ path: MANIFEST_FILE, text: manifestJson(manifest) }, { path: MANIFEST_MD, text: renderMarkdown(manifest, orphans) })
     const archived = records.map(r => r.record)
-    const keepTitle = change.merge ? (latest.get(change.merge.keep)?.title ?? '') : ''
-    const message = commitMessage(isFiling ? self : undefined, keepTitle, archived, kept.length, projects.length)
+    const keepTitles = (change.merges ?? []).filter(m => records.some(r => r.record.into === m.keep)).map(m => latest.get(m.keep)?.title ?? '')
+    const message = commitMessage(isFiling ? self : undefined, keepTitles, archived, kept.length, projects.length)
     let isDone: boolean
     try {
       isDone = await snap.write(files, deletes, message)
@@ -901,7 +916,7 @@ async function paneAction($: EngineInterface, action: 'merge' | 'delete') {
   await $.state.set(PANE_NOTICE, action === 'merge' ? 'Merging…' : 'Deleting…')
   try {
     const [keep = '', ...drop] = edit.picked
-    const r = await changeThreads($, action === 'merge' ? { merge: { keep, drop } } : { remove: edit.picked })
+    const r = await changeThreads($, action === 'merge' ? { merges: [{ keep, drop }] } : { remove: edit.picked })
     if (!r.ok) {
       await $.state.set(PANE_NOTICE, `${action === 'merge' ? 'Merge' : 'Delete'} failed: ${r.error}`)
       return
@@ -918,6 +933,167 @@ async function paneAction($: EngineInterface, action: 'merge' | 'delete') {
   } finally {
     await $.state.set(IS_BUSY, false)
   }
+}
+
+// ---- Tidying ----------------------------------------------------------------------------------
+
+// The manifest read afresh, with what a tidy needs of it: every thread by short name, and the
+// threads it must leave listed (this session's, and any active in the last few hours).
+async function tidyContext($: EngineInterface) {
+  await loadRelated($, true)
+  const { value: manifest = null } = await $.state.get(MANIFEST)
+  const { value: error = '' } = await $.state.get(MANIFEST_ERROR)
+  if (!manifest) return { ok: false as const, error: error || 'the manifest could not be read' }
+  const now = await $.clock.now()
+  const refs = tidyRefs(manifest.projects)
+  return { ok: true as const, manifest, now, refs, guard: protectedIds(manifest.projects, await $.session.id(), now) }
+}
+
+// Asks the judge model which threads to merge and which to archive, the rules' finds given as
+// hints; with no answer the rules' finds stand alone. Held to the guards either way.
+async function reviewRaw($: EngineInterface, refs: readonly TidyRef[], guard: ReadonlySet<string>, now: number): Promise<{ raw: RawTidy; by: TidyPlan['by'] }> {
+  const rules = tidyRules(refs, now)
+  if (refs.length === 0) return { raw: rules, by: 'model' }
+  const { system, prompt } = tidyPrompt(refs, rules, guard, now)
+  const model = live.judgeModel || (await $.session.model())
+  const r = await $.model.complete({ model, system, prompt, maxTokens: 8192, effort: 'medium', timeoutMs: 180_000 })
+  const parsed = r.isAnswered ? parseTidy(r.text) : null
+  if (parsed) return { raw: parsed, by: 'model' }
+  $.ui.log(`judge: the tidy review falls back to the rules: ${r.isAnswered ? "the model's answer did not parse" : `the model gave no answer (${r.reason})`}`, { to: 'debug' })
+  return { raw: rules, by: 'rules' }
+}
+
+// A tidy review of every listed thread: kept in the state for the pane and /judge tidy apply.
+async function reviewThreads($: EngineInterface): Promise<{ ok: true; plan: TidyPlan } | { ok: false; error: string }> {
+  const ctx = await tidyContext($)
+  if (!ctx.ok) return ctx
+  const { raw, by } = await reviewRaw($, ctx.refs, ctx.guard, ctx.now)
+  const plan: TidyPlan = { at: ctx.now, by, reviewed: ctx.refs.length, proposals: guardTidy(raw, ctx.refs, ctx.guard).proposals }
+  await $.state.set(TIDY_PLAN, plan)
+  await $.state.set(TIDY_OFF, [])
+  return { ok: true, plan }
+}
+
+// Applies tidy steps in one commit. A step whose threads changed since the review (merged or
+// archived elsewhere, bundled into another project) is left out rather than failing the rest.
+async function applyTidy($: EngineInterface, proposals: readonly TidyProposal[]): Promise<{ ok: true; done: Outcome; text: string } | { ok: false; error: string }> {
+  await loadRelated($, true)
+  const { value: manifest = null } = await $.state.get(MANIFEST)
+  if (!manifest) return { ok: false, error: 'the manifest could not be read' }
+  const { merges, remove, dropped } = stillValid(proposals, manifest.projects)
+  if (merges.length === 0 && remove.length === 0) return { ok: false, error: 'none of these steps holds any more: their threads changed since the review' }
+  const r = await changeThreads($, { merges, remove })
+  if (!r.ok) return r
+  const merged = r.done.archived.filter(a => a.reason === 'merged').length
+  const archived = r.done.archived.filter(a => a.reason === 'deleted' && remove.includes(a.sessionId)).length
+  return { ok: true, done: r.done, text: tidyDone(merged, merges.length, archived, dropped) }
+}
+
+// A thread's title as the tidy shows it, from the manifest; its id's start when it is not listed.
+function titleIn(manifest: Manifest | null) {
+  const titles = new Map((manifest?.projects ?? []).flatMap(p => p.threads.map(t => [t.sessionId, t.title] as const)))
+  return (id: string) => clipTitle(titles.get(id) ?? id.slice(0, 8))
+}
+
+async function paneTidy($: EngineInterface) {
+  const { value: isBusy = false } = await $.state.get(IS_BUSY)
+  if (isBusy) return
+  await $.state.set(IS_BUSY, true)
+  await $.state.set(PANE_NOTICE, 'Reviewing the threads…')
+  try {
+    const r = await reviewThreads($)
+    await $.state.set(PANE_NOTICE, !r.ok ? `The review failed: ${r.error}` : r.plan.proposals.length ? '' : `Reviewed ${plural(r.plan.reviewed, 'thread')}: nothing to tidy.`)
+  } finally {
+    await $.state.set(IS_BUSY, false)
+  }
+}
+
+async function paneApplyTidy($: EngineInterface) {
+  const { value: plan = null } = await $.state.get(TIDY_PLAN)
+  const { value: off = [] } = await $.state.get(TIDY_OFF)
+  const { value: isBusy = false } = await $.state.get(IS_BUSY)
+  const picked = plan ? pickedProposals(plan, off) : []
+  if (picked.length === 0 || isBusy) return
+  await $.state.set(IS_BUSY, true)
+  await $.state.set(PANE_NOTICE, 'Tidying…')
+  try {
+    const r = await applyTidy($, picked)
+    await $.state.set(PANE_NOTICE, r.ok ? r.text : `The tidy failed: ${r.error}`)
+    if (r.ok) {
+      await $.state.set(TIDY_PLAN, null)
+      await $.state.set(TIDY_OFF, [])
+    }
+  } finally {
+    await $.state.set(IS_BUSY, false)
+  }
+}
+
+// list_threads: every listed thread for the model to judge, with the rules' finds and the guards.
+async function listThreadsText($: EngineInterface, project: string) {
+  const ctx = await tidyContext($)
+  if (!ctx.ok) return `The manifest could not be read: ${ctx.error}`
+  const want = project.trim().toLowerCase()
+  const projects = ctx.manifest.projects.filter(p => !want || p.name.toLowerCase().includes(want) || p.slug.includes(want))
+  const n = projects.reduce((k, p) => k + p.threads.length, 0)
+  const selfId = await $.session.id()
+  const lines = [
+    `Judgeiverse manifest ${live.repo}: ${plural(n, 'thread')} in ${plural(projects.length, 'project')}${want ? ` matching "${project.trim()}"` : ''}. This session is ${selfId}.`,
+    `Protected threads (this session, or active in the last ${RECENT_MS / 3_600_000} hours) are never merged away or archived; one can be the thread a merge keeps.`,
+  ]
+  for (const p of projects) {
+    lines.push('', `## ${p.name} (${p.threads.length})${p.description ? `: ${p.description}` : ''}`)
+    for (const t of p.threads) {
+      const marks = [t.status, ago(t.lastActiveAt, ctx.now), `${t.account} on ${t.host}`]
+      if (ctx.guard.has(t.sessionId)) marks.push('protected')
+      if (t.merged?.length) marks.push(`${t.merged.length} merged in`)
+      const summary = t.summary.replace(/\s+/g, ' ').trim()
+      lines.push(`- ${t.sessionId} · ${t.title.replace(/\s+/g, ' ').trim() || 'Untitled'} · ${marks.join(' · ')}`, `  ${summary.length > TOOL_SUMMARY_MAX ? `${summary.slice(0, TOOL_SUMMARY_MAX - 1)}…` : summary}`)
+    }
+  }
+  const shown = new Set(projects.flatMap(p => p.threads.map(t => t.sessionId)))
+  const refs = ctx.refs.filter(r => shown.has(r.thread.sessionId))
+  const hints = guardTidy(tidyRules(refs, ctx.now), refs, ctx.guard).proposals
+  const titleOf = titleIn(ctx.manifest)
+  if (hints.length) {
+    lines.push('', 'What simple rules found (same titles, empty, done, idle over two weeks); check each against the summaries:')
+    for (const h of hints) lines.push(`- ${proposalLabel(h, titleOf)}: ${h.kind === 'merge' ? `keep ${h.keep}, drop ${h.drop.join(', ')}` : h.drop[0]} (${h.reason})`)
+  }
+  lines.push('', `To clean up, show the person the steps you propose and, once they agree, call ${TIDY_TOOL} with them.`)
+  return lines.join('\n')
+}
+
+// tidy_threads: the model's merges and archives, held to the same guards, in one commit.
+async function tidyThreadsText($: EngineInterface, input: Record<string, unknown>) {
+  const strings = (v: unknown) => (Array.isArray(v) ? v.filter((x): x is string => typeof x === 'string' && x.trim() !== '').map(x => x.trim()) : [])
+  const groups = (Array.isArray(input['merge']) ? input['merge'] : [])
+    .filter((g): g is Record<string, unknown> => !!g && typeof g === 'object')
+    .map(g => ({ keep: typeof g['keep'] === 'string' ? g['keep'].trim() : '', drop: strings(g['drop']) }))
+  const archive = strings(input['archive'])
+  if (groups.length === 0 && archive.length === 0) return 'Nothing changed: give `merge` groups ({ keep, drop }) or `archive` ids.'
+  const ctx = await tidyContext($)
+  if (!ctx.ok) return `Nothing changed: the manifest could not be read: ${ctx.error}`
+  // Every id named, a full session id or one's first characters, resolved before anything is written.
+  const named = [...groups.flatMap(g => [g.keep, ...g.drop]), ...archive]
+  const { found, errors } = findThreads(ctx.manifest.projects, named)
+  if (errors.length) return `Nothing changed: ${errors.join('; ')}.`
+  const idOf = (name: string) => found.find(f => f.thread.sessionId === name || f.thread.sessionId.startsWith(name))?.thread.sessionId ?? name
+  const refOf = new Map(ctx.refs.map(r => [r.thread.sessionId, r.ref]))
+  const ref = (name: string) => refOf.get(idOf(name)) ?? name
+  const raw: RawTidy = {
+    merge: groups.filter(g => g.keep && g.drop.length).map(g => ({ keep: ref(g.keep), drop: g.drop.map(ref), reason: 'asked by the model' })),
+    archive: archive.map(a => ({ id: ref(a), reason: 'asked by the model' })),
+  }
+  const { proposals, skipped } = guardTidy(raw, ctx.refs, ctx.guard)
+  const byRef = new Map(ctx.refs.map(r => [r.ref, r.thread]))
+  const left = skipped.map(s => `- ${byRef.get(s.ref)?.sessionId ?? s.ref} (${byRef.get(s.ref)?.title ?? 'unknown'}): ${s.why}`)
+  if (proposals.length === 0) return ['Nothing changed: every step was turned down.', ...left].join('\n')
+  const r = await applyTidy($, proposals)
+  if (!r.ok) return `Nothing changed: ${r.error}`
+  const titleOf = titleIn(ctx.manifest)
+  const lines = [r.text, '', ...proposals.map(p => `- ${proposalLabel(p, titleOf)}${p.kind === 'merge' ? `: ${p.drop.map(titleOf).join(', ')}` : ''}`)]
+  if (left.length) lines.push('', 'Left alone:', ...left)
+  lines.push('', `The manifest now lists ${plural(r.done.threads, 'thread')} in ${plural(r.done.projects, 'project')}.`)
+  return lines.join('\n')
 }
 
 // What build this is, for the pane and /judge: the manifest's version when it carries one, else
@@ -1146,7 +1322,8 @@ async function loadRelated($: EngineInterface, isQuiet: boolean): Promise<{ rela
     const { value: related = [] } = await $.state.get(RELATED)
     if (related.length > 0 && !isQuiet) {
       const named = related.slice(0, RELATED_SHOWN).map(describeThread).join('; ')
-      $.ui.toast(`Judge: ${related.length} open thread${related.length === 1 ? '' : 's'} already cover this project: ${named}. /judge panel shows them.`, { timeoutMs: 12_000 })
+      const tidy = related.length >= TIDY_NUDGE ? ' /judge tidy proposes which to merge or archive.' : ''
+      $.ui.toast(`Judge: ${related.length} open thread${related.length === 1 ? '' : 's'} already cover this project: ${named}. /judge panel shows them.${tidy}`, { timeoutMs: 12_000 })
     }
     const files = tree.filter(e => e.path.startsWith(`${THREADS_DIR}/`) && e.path.endsWith('.json')).map(e => e.path.slice(e.path.lastIndexOf('/') + 1, -'.json'.length))
     const segments = new Set(files)
@@ -1265,6 +1442,46 @@ async function lineModel($: EngineInterface) {
   return { isFlash, flashColor, flashText, main, tone, parts, title, fullTitle, tally, canFile }
 }
 
+// Declares the model's two tools. A host that takes no plugin tools keeps the rest of the mod.
+async function registerTools($: EngineInterface) {
+  try {
+    await $.tool.register({
+      name: LIST_TOOL,
+      description:
+        "List the threads in the person's Judgeiverse manifest: every Claude Code conversation they filed, by project, with session id, title, status, age, account and summary, plus what simple rules flag as duplicates, finished or idle. Read-only. Use it when the person wants to see, review, merge or clean up their open threads; judge from the summaries which ones continue the same work or are done, then propose steps with tidy_threads.",
+      inputSchema: {
+        type: 'object',
+        properties: { project: { type: 'string', description: "Only projects whose name contains this text. Empty: every project." } },
+      },
+    })
+    await $.tool.register({
+      name: TIDY_TOOL,
+      description:
+        "Clean up the person's Judgeiverse manifest in one commit: merge threads that continue the same work (each group folds `drop` into `keep`, all in one project) and archive threads that are finished, abandoned or empty. A thread leaving the list keeps one line in its project's sub-manifest. This session's thread and any thread active in the last 6 hours are never merged away or archived. Name threads by session id or its first 8 characters, as list_threads gives them. Show the person the steps and get their go-ahead before calling it.",
+      inputSchema: {
+        type: 'object',
+        properties: {
+          merge: {
+            type: 'array',
+            description: 'Merge groups.',
+            items: {
+              type: 'object',
+              properties: {
+                keep: { type: 'string', description: 'The thread kept: usually the most recent or the most complete.' },
+                drop: { type: 'array', items: { type: 'string' }, description: 'The threads folded into it.' },
+              },
+              required: ['keep', 'drop'],
+            },
+          },
+          archive: { type: 'array', items: { type: 'string' }, description: 'Threads to take off the list.' },
+        },
+      },
+    })
+  } catch (err) {
+    $.ui.log(`judge: the thread tools could not be registered: ${err instanceof Error ? err.message : String(err)}`, { to: 'debug' })
+  }
+}
+
 export const register: Register = (on, options) => {
   live.repo = parseRepo(String(options[REPO_OPTION] ?? ''))
   live.account = String(options[ACCOUNT_OPTION] ?? '').trim()
@@ -1276,13 +1493,14 @@ export const register: Register = (on, options) => {
   on('session.start', async ($, e, next) => {
     await $.command.register({
       name: JUDGE_COMMAND,
-      description: 'The thread manifest: status, file or close this thread, list the open threads of this project, open the pane, merge or delete threads',
-      argumentHint: '[status | file | close | threads | pane | merge <keep> <other>… | delete <id>…]',
+      description: 'The thread manifest: status, file or close this thread, list the open threads of this project, open the pane, merge, delete or tidy threads',
+      argumentHint: '[status | file | close | threads | pane | tidy [apply [n…]] | merge <keep> <other>… | delete <id>…]',
       immediate: true,
     })
 
     live.sessionId = await $.session.id()
     await readVersion($)
+    if (isJudging()) await registerTools($)
     for (const key of await $.store.keys()) {
       if (OLD_STORE_KEY.test(key)) await $.store.delete(key)
     }
@@ -1383,6 +1601,28 @@ export const register: Register = (on, options) => {
       const { related } = await loadRelated($, true)
       return { text: threadsReply(related, await $.clock.now()) }
     }
+    if (word === 'tidy') {
+      if (rest[0]?.toLowerCase() === 'apply') {
+        const { value: plan = null } = await $.state.get(TIDY_PLAN)
+        const { value: off = [] } = await $.state.get(TIDY_OFF)
+        if (!plan || plan.proposals.length === 0) return { text: '**Tidy:** no review to apply. `/judge tidy` makes one.' }
+        const numbers = rest.slice(1).map(n => Number.parseInt(n, 10))
+        if (numbers.some(n => !Number.isInteger(n) || n < 1 || n > plan.proposals.length)) {
+          return { text: `**Tidy:** name steps by their numbers, 1 to ${plan.proposals.length}.` }
+        }
+        const steps = numbers.length ? plan.proposals.filter((_, i) => numbers.includes(i + 1)) : pickedProposals(plan, off)
+        if (steps.length === 0) return { text: '**Tidy:** every step is unticked; nothing to apply.' }
+        const r = await applyTidy($, steps)
+        if (!r.ok) return { text: `**Tidy:** nothing changed: ${mdText(r.error)}` }
+        await $.state.set(TIDY_PLAN, null)
+        await $.state.set(TIDY_OFF, [])
+        return { text: `**${mdText(r.text)}**\n\nThe manifest now lists ${plural(r.done.threads, 'thread')} in ${plural(r.done.projects, 'project')}.` }
+      }
+      const r = await reviewThreads($)
+      if (!r.ok) return { text: `**Tidy:** the review failed: ${mdText(r.error)}` }
+      const { value: manifest = null } = await $.state.get(MANIFEST)
+      return { text: tidyReply(r.plan, titleIn(manifest)) }
+    }
     if (word === 'merge' || word === 'delete') {
       const usage = word === 'merge'
         ? '**Judge:** `/judge merge <keep> <other>…` folds the other threads into the first, all of one project. Name each by its session id or its first eight characters; `/judge pane` lets you pick them instead.'
@@ -1401,7 +1641,7 @@ export const register: Register = (on, options) => {
       if (word === 'merge' && found.length < 2) return { text: usage }
       const ids = found.map(f => f.thread.sessionId)
       const [keep = '', ...drop] = ids
-      const r = await changeThreads($, word === 'merge' ? { merge: { keep, drop } } : { remove: ids })
+      const r = await changeThreads($, word === 'merge' ? { merges: [{ keep, drop }] } : { remove: ids })
       if (!r.ok) return { text: `**Judge:** the ${word} failed: ${mdText(r.error)}` }
       return { text: changeReply(r.done, projectNames.join(', ')) }
     }
@@ -1424,9 +1664,23 @@ export const register: Register = (on, options) => {
     if (verdict) lines.push(`- **Verdict:** ${mdText(verdict.summary)}${verdict.project ? ` *(project: ${mdText(verdict.project)})*` : ''}`)
     lines.push(`- **Manifest:** ${counter(manifestThreads, manifestProjects, updates).join(' · ') || 'not read yet'}${updatedAt ? `; last updated ${clockTime(updatedAt)}` : ''}`)
     if (related.length) lines.push(`- **This project:** ${plural(related.length, 'other open thread')}; \`/judge threads\` lists them`)
-    lines.push('', '`/judge file` · `/judge close` · `/judge threads` · `/judge pane` · `/judge merge <keep> <other>…` · `/judge delete <id>…`')
+    lines.push('', '`/judge file` · `/judge close` · `/judge threads` · `/judge pane` · `/judge tidy` · `/judge merge <keep> <other>…` · `/judge delete <id>…`')
     return { text: lines.join('\n') }
   })
+
+  // The model's tools: list_threads reads the manifest for it to judge; tidy_threads applies the
+  // merges and archives it settled on with the person, under the same guards as the pane's tidy.
+  on('tool.call', { tool: LIST_TOOL_ID }, async ($, e) => {
+    if (!isJudging()) return { result: 'No manifest repository is set, so there are no threads to list.' }
+    // The tool's arguments ride on the event beside `tool`.
+    const project = (e as Record<string, unknown>)['project']
+    return { result: await listThreadsText($, typeof project === 'string' ? project : '') }
+  }).catch(($, e, next) => ({ result: 'Listing the threads failed; nothing changed.' }))
+
+  on('tool.call', { tool: TIDY_TOOL_ID }, async ($, e) => {
+    if (!isJudging()) return { result: 'Nothing changed: no manifest repository is set.' }
+    return { result: await tidyThreadsText($, e as Record<string, unknown>) }
+  }).catch(($, e, next) => ({ result: 'The tidy failed before it committed anything, or its outcome is unknown; list_threads shows the manifest as it stands.' }))
 
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
     if (e.props.hasSurvey) return next(e)
@@ -1538,6 +1792,8 @@ export const register: Register = (on, options) => {
       const { value: selfArchived = null } = await $.state.get(SELF_ARCHIVED)
       const { value: openThread = null } = await $.state.get(PANE_OPEN_THREAD)
       const { value: openArchive = null } = await $.state.get(PANE_OPEN_ARCHIVE)
+      const { value: tidyPlan = null } = await $.state.get(TIDY_PLAN)
+      const { value: tidyOff = [] } = await $.state.get(TIDY_OFF)
       const { value: shownAt = 0 } = await $.state.get(NOW)
       const now = shownAt || (await $.clock.now())
       const selfId = await $.session.id()
@@ -1613,6 +1869,42 @@ export const register: Register = (on, options) => {
         )
       }
 
+      // The tidy review: each step one row the person ticks or unticks, then Apply and Dismiss.
+      const tidyCard = (plan: TidyPlan) => {
+        const titleOf = titleIn(manifest)
+        const picked = pickedProposals(plan, tidyOff).length
+        return (
+          <Box flexDirection="column" rowGap="xs" paddingX="sm" paddingY="xs" borderStyle="round" borderColor="subtle">
+            <Box justifyContent="space-between" alignItems="center" columnGap="sm">
+              <Text weight="semibold">Tidy up</Text>
+              <Text size="caption" dimColor>{`${plural(plan.proposals.length, 'step')} · ${plural(plan.reviewed, 'thread')} reviewed`}</Text>
+            </Box>
+            {plan.by === 'rules' && plan.proposals.length > 0 && (
+              <Text size="caption" color="warning">The model gave no answer, so these are the rules' finds alone: same titles, empty, done, idle.</Text>
+            )}
+            {plan.proposals.length === 0 && <Text size="footnote" dimColor>Nothing to tidy: no thread looks like a duplicate, finished or abandoned.</Text>}
+            {plan.proposals.map(step => {
+              const isOn = !tidyOff.includes(step.id)
+              return (
+                <Box flexDirection="column">
+                  <Button key={`tidy-pick:${step.id}`} plain onPress={() => update($, TIDY_OFF, off => ((off ?? []).includes(step.id) ? (off ?? []).filter(id => id !== step.id) : [...(off ?? []), step.id]))}>
+                    {`${isOn ? '☑' : '☐'} ${proposalLabel(step, titleOf)}`}
+                  </Button>
+                  <Box flexDirection="column" paddingLeft="md">
+                    {step.kind === 'merge' && step.drop.map(id => <Text size="footnote" dimColor strikethrough wrap="truncate-end">{titleOf(id)}</Text>)}
+                    <Text size="caption" dimColor>{`${step.project} · ${step.reason}`}</Text>
+                  </Box>
+                </Box>
+              )
+            })}
+            <Box columnGap="sm" flexWrap="wrap" paddingTop="xs">
+              {picked > 0 && <Button key="tidy-apply" variant="primary" label={isBusy ? 'Working…' : `Apply ${picked}`} onPress={() => paneApplyTidy($)} />}
+              <Button key="tidy-dismiss" plain label="Dismiss" onPress={() => $.state.set(TIDY_PLAN, null)} />
+            </Box>
+          </Box>
+        )
+      }
+
       const section = (p: ManifestProject) => {
         const open = openOf(p)
         const isEditing = edit?.slug === p.slug
@@ -1651,7 +1943,10 @@ export const register: Register = (on, options) => {
         <Box flexDirection="column" rowGap="sm">
           <Box justifyContent="space-between" alignItems="center" columnGap="sm">
             <Text size="heading" weight="semibold">Threads</Text>
-            <Button key="refresh" plain label={isBusy ? 'Working…' : '↻ Refresh'} onPress={() => refreshPane($)} />
+            <Box columnGap="sm" alignItems="center">
+              {manifest && <Button key="tidy" plain label="Tidy up" onPress={() => paneTidy($)} />}
+              <Button key="refresh" plain label={isBusy ? 'Working…' : '↻ Refresh'} onPress={() => refreshPane($)} />
+            </Box>
           </Box>
           <Text size="caption" dimColor color={error && !manifest ? 'warning' : undefined}>{head}</Text>
           <Box columnGap="sm" flexWrap="wrap">
@@ -1659,6 +1954,7 @@ export const register: Register = (on, options) => {
             <Button key="view-all" variant={view === 'all' ? 'primary' : 'secondary'} label={`All · ${openIn(all)}`} onPress={() => $.state.set(PANE_VIEW, 'all')} />
           </Box>
           {notice !== '' && <Text size="footnote" dimColor>{notice}</Text>}
+          {tidyPlan && tidyCard(tidyPlan)}
           {selfArchived && <Text size="footnote" color="warning">{`This thread was ${selfArchivedText(selfArchived, manifest)}.`}</Text>}
           {manifest && shown.length === 0 && (
             <Text size="footnote" dimColor>

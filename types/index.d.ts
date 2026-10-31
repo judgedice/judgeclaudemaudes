@@ -117,6 +117,32 @@ export type PaneView = 'project' | 'all'
 /** The pane's edit mode on one project: the threads picked, in the order picked (the first is kept on a merge). */
 export type PaneEdit = { slug: string; picked: string[] } | null
 
+/** One step a tidy review proposes: fold `drop` into `keep`, or archive the one thread in `drop`. */
+export type TidyProposal = {
+  /** Stable within a plan: `merge:<keep>` or `archive:<session id>`. */
+  id: string
+  kind: 'merge' | 'archive'
+  /** The thread kept; a merge's only. */
+  keep?: string
+  /** The threads folded into `keep` (merge), or the one taken out (archive). */
+  drop: string[]
+  /** Why, in one line the person can check at a glance. */
+  reason: string
+  /** The project's name, as the manifest lists it. */
+  project: string
+}
+
+/** A tidy review of the manifest's threads: what to merge and what to archive. */
+export type TidyPlan = {
+  /** When it was made (ms since epoch). */
+  at: number
+  /** `model`: the judge model reviewed the threads. `rules`: it gave no answer, so the plan is the rules' finds alone. */
+  by: 'model' | 'rules'
+  /** How many listed threads the review looked at. */
+  reviewed: number
+  proposals: TidyProposal[]
+}
+
 declare module 'claude-code' {
   interface PluginState {
     'judge-keep-warm': {
@@ -168,6 +194,10 @@ declare module 'claude-code' {
       paneOpenThread: string | null
       /** The project whose archived threads the pane shows; null = none. */
       paneOpenArchive: string | null
+      /** The last tidy review, until it is applied or dismissed; null = none. */
+      tidyPlan: TidyPlan | null
+      /** The ids of the tidy plan's proposals the person unticked; the rest apply. */
+      tidyOff: string[]
     }
   }
 }

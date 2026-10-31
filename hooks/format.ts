@@ -1,6 +1,6 @@
 // Markdown for the chat and the pane: what `/judge` prints (the command's row draws its text as
 // markdown on every surface) and the thread lists the pane draws. Pure: text in, text out.
-import type { ManifestThread } from '../types'
+import type { ManifestThread, TidyPlan, TidyProposal } from '../types'
 
 const MINUTE_MS = 60_000
 const HOUR_MS = 60 * MINUTE_MS
@@ -71,6 +71,37 @@ export function threadsReply(related: readonly ManifestThread[], now: number) {
   if (related.length === 0) return '**Judge:** no other open thread in the manifest covers this project (repository or directory).'
   const head = `**Judge:** ${plural(related.length, 'open thread')} already ${related.length === 1 ? 'covers' : 'cover'} this project. Resume one instead of starting another.`
   return [head, ...related.map(t => threadBlock(t, now)), '`/judge panel` shows them beside the chat.'].join('\n\n')
+}
+
+// ---- Tidying ---------------------------------------------------------------------------------
+
+// A tidy step as one line of plain text: "Merge 2 into “Title”" or "Archive “Title”".
+export function proposalLabel(p: TidyProposal, titleOf: (id: string) => string) {
+  return p.kind === 'merge' ? `Merge ${p.drop.length} into “${titleOf(p.keep ?? '')}”` : `Archive “${titleOf(p.drop[0] ?? '')}”`
+}
+
+// `/judge tidy`: the review's steps, numbered for `/judge tidy apply <n>…`.
+export function tidyReply(plan: TidyPlan, titleOf: (id: string) => string) {
+  const by = plan.by === 'model' ? '' : ' The model gave no answer, so these are the rules\' finds alone (same titles, empty, done, idle).'
+  if (plan.proposals.length === 0) return `**Tidy:** reviewed ${plural(plan.reviewed, 'thread')}; none looks like a duplicate, finished or abandoned.`
+  const lines = [`**Tidy:** reviewed ${plural(plan.reviewed, 'thread')}, ${plural(plan.proposals.length, 'step')} proposed.${by}`, '']
+  plan.proposals.forEach((p, i) => {
+    const head = p.kind === 'merge' ? `**Merge** into **${mdText(titleOf(p.keep ?? ''))}**` : `**Archive** **${mdText(titleOf(p.drop[0] ?? ''))}**`
+    lines.push(`${i + 1}. ${head} · *${mdText(p.project)}*`)
+    if (p.kind === 'merge') for (const id of p.drop) lines.push(`   - ~~${mdText(titleOf(id))}~~`)
+    lines.push(`   ${mdText(p.reason)}`)
+  })
+  lines.push('', '`/judge tidy apply` applies every step; `/judge tidy apply 1 3` applies those alone. The pane\'s **Tidy up** lets you untick steps.')
+  return lines.join('\n')
+}
+
+// What a tidy did, in one line for the pane and the chat.
+export function tidyDone(merged: number, groups: number, archived: number, dropped: number) {
+  const parts: string[] = []
+  if (merged) parts.push(`merged ${plural(merged, 'thread')} into ${plural(groups, 'kept thread')}`)
+  if (archived) parts.push(`archived ${plural(archived, 'thread')}`)
+  const gone = dropped ? ` ${plural(dropped, 'step')} left out: ${dropped === 1 ? 'its threads' : 'their threads'} changed since the review.` : ''
+  return `Tidied: ${parts.join(', ') || 'nothing changed'}. One line on each is kept in its project's sub-manifest.${gone}`
 }
 
 // ---- The pane's rows: plain text, no markdown -------------------------------------------------
