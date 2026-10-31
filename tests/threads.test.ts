@@ -1,10 +1,10 @@
 import { expect, mock, test } from 'claude-code/testing'
 
 import { mdText, threadsReply } from '../hooks/format'
-import { briefOf, buildOf, fromBase64, toBase64 } from '../hooks/judge'
+import { briefOf, bundle, buildOf, fromBase64, previousAssignment, toBase64 } from '../hooks/judge'
 import { guardTidy, parseTidy, protectedIds, stillValid, tidyRefs, tidyRules, titleKey } from '../hooks/tidy'
 import { RELEASE } from '../hooks/version'
-import type { Manifest, ManifestProject, ManifestThread, ProjectArchive } from '../types'
+import type { Manifest, ManifestProject, ManifestThread, ProjectArchive, ThreadEntry } from '../types'
 
 const OPTIONS = { manifest_repo: 'me/claude-threads', account_label: 'work', github_token: 'ghp_test', file_threads: true }
 const START = 1_700_000_000_000
@@ -698,4 +698,54 @@ test('the model lists the threads with list_threads and tidies them with tidy_th
   const bad = await $.tool.call({ tool: 'mcp__judge-keep-warm__tidy_threads', archive: ['zz'] })
   expect(String(bad.result)).toBe('Nothing changed: `zz` is too short to name a thread: give at least four characters of its session id.')
   expect(repo.commits.length).toBe(1)
+})
+
+// ---- Bundling into existing projects ------------------------------------------------------------
+
+function entry(sessionId: string, repo: string | null): ThreadEntry {
+  return {
+    schema: 1, sessionId, account: 'a', host: 'h', surface: 'terminal', title: sessionId, cwd: '/home/me', repo, model: 'opus', contextTokens: 1, turns: 1,
+    startedAt: '2023-11-14T18:00:00.000Z', lastActiveAt: '2023-11-14T20:00:00.000Z', cacheExpiresAt: '', keepWarm: false, status: 'open',
+    filedAt: '2023-11-14T20:05:00.000Z', filedBy: 'judge', summary: 'Work.', topics: [], project: '', nextStep: '', resume: '',
+  }
+}
+
+test("a thread with no repository joins a repository's project by its name, not a second project of that name", async () => {
+  const entries = [
+    entry('in-repo', 'https://github.com/judgedice/judgeiverse.git'),
+    entry('by-name', null),
+    entry('by-repo', null),
+    entry('elsewhere', null),
+    entry('mine', 'https://github.com/me/app'),
+    entry('yours', 'https://github.com/you/app'),
+    entry('which-app', null),
+  ]
+  const projects = bundle(
+    entries,
+    [
+      { name: 'Judgeiverse', description: 'The thread manifest.', threadIds: ['by-name'] },
+      { name: 'judgedice/judgeiverse', description: '', threadIds: ['by-repo'] },
+      { name: 'Notes', description: 'Loose notes.', threadIds: ['elsewhere'] },
+      // Two repositories' projects are named "app": the name alone cannot say which, so it starts its own.
+      { name: 'app', description: '', threadIds: ['which-app'] },
+    ],
+    [],
+    LATER,
+  )
+  const ids = (slug: string) => projects.find(p => p.slug === slug)?.threads.map(t => t.sessionId).sort()
+  expect(ids('judgedice-judgeiverse')).toEqual(['by-name', 'by-repo', 'in-repo'])
+  expect(projects.find(p => p.slug === 'judgedice-judgeiverse')?.name).toBe('judgeiverse')
+  expect(projects.filter(p => p.name.toLowerCase() === 'judgeiverse').length).toBe(1)
+  expect(ids('notes')).toEqual(['elsewhere'])
+  expect(ids('me-app')).toEqual(['mine'])
+  expect(ids('you-app')).toEqual(['yours'])
+  expect(ids('app')).toEqual(['which-app'])
+
+  // A merge or a deletion re-bundles with no model call: every thread stays where it was.
+  const again = bundle(entries, previousAssignment(projects), projects, LATER)
+  expect(ids('judgedice-judgeiverse')).toEqual(again.find(p => p.slug === 'judgedice-judgeiverse')?.threads.map(t => t.sessionId).sort())
+  // So does a filing whose model gave no answer.
+  const unanswered = bundle(entries, [], projects, LATER)
+  expect(unanswered.find(p => p.slug === 'judgedice-judgeiverse')?.threads.map(t => t.sessionId).sort()).toEqual(['by-name', 'by-repo', 'in-repo'])
+  expect(unanswered.map(p => p.slug).sort()).toEqual(projects.map(p => p.slug).sort())
 })

@@ -173,8 +173,11 @@ export const DAY_MS = 24 * 60 * 60_000
 export const STALE_DAYS = 14
 export const CLOSED_DAYS = 30
 
-/** What the model answers when asked to bundle: a project per group, each naming its thread ids. */
-export type Assignment = { name: string; description: string; threadIds: string[] }[]
+/**
+ * What the model answers when asked to bundle: a project per group, each naming its thread ids.
+ * `slug` is set only where the project is known already (the last manifest's, on a merge or a deletion).
+ */
+export type Assignment = { name: string; description: string; threadIds: string[]; slug?: string }[]
 
 export function slugify(name: string) {
   return name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 48) || 'project'
@@ -228,6 +231,7 @@ export function bundlePrompt(live: readonly ThreadEntry[], previous: readonly Ma
     'Rules:',
     '- Every thread id appears in exactly one project. Invent no ids.',
     '- Threads about the same repository, product, client or piece of work belong together, across accounts and machines.',
+    "- A thread about a repository's work belongs in that repository's project: use the project's exact name.",
     "- Keep an existing project's exact name when its threads still fit it; rename or split only when the threads clearly ask for it. New projects get short, stable names (2-5 words), no dates.",
     "- A project's description is one sentence on what the work is.",
     '- Prefer fewer, meaningful projects over many thin ones, but do not merge unrelated work.',
@@ -313,6 +317,22 @@ export function bundle(entries: readonly ThreadEntry[], assigned: Assignment, pr
       resume: t.resume,
     })
   }
+  // A name the model or the last manifest gives may be an existing project's. A repository's
+  // project is keyed by owner and repository, not by its name, so the name alone would start a
+  // second project under the same name. The one project of that name (or repository) takes the
+  // thread; a name several projects share starts its own, as before.
+  const slugFor = (name: string) => {
+    const want = name.trim().toLowerCase()
+    const named = (ps: Iterable<{ name: string; slug: string; repos: Iterable<string> }>) => {
+      const hits = new Set<string>()
+      for (const p of ps) if (p.name.trim().toLowerCase() === want || [...p.repos].some(r => r.toLowerCase() === want)) hits.add(p.slug)
+      return hits
+    }
+    const placed = named(projects.values())
+    if (placed.size > 0) return placed.size === 1 ? [...placed][0]! : slugify(name)
+    const earlier = named(previous)
+    return earlier.size === 1 ? [...earlier][0]! : slugify(name)
+  }
   const seen = new Set<string>()
   // Repositories first: every thread of one repository is one project, whatever the model says.
   for (const t of entries) {
@@ -326,7 +346,7 @@ export function bundle(entries: readonly ThreadEntry[], assigned: Assignment, pr
       const t = byId.get(id)
       if (!t || seen.has(id)) continue
       seen.add(id)
-      place(a.name, a.description, t)
+      place(a.name, a.description, t, a.slug ?? slugFor(a.name))
     }
   }
   // Closed threads keep the project the last manifest had them in; anything the model left
@@ -337,7 +357,7 @@ export function bundle(entries: readonly ThreadEntry[], assigned: Assignment, pr
     if (seen.has(t.sessionId)) continue
     const prior = previousProject.get(t.sessionId)
     const f = prior ? { name: prior.name, description: prior.description } : fallbackProject(t)
-    place(f.name, f.description, t)
+    place(f.name, f.description, t, prior ? prior.slug : slugFor(f.name))
   }
   const out = [...projects.values()].map(p => ({
     name: p.name,
@@ -478,7 +498,7 @@ export function tombstones(archives: readonly ProjectArchive[]) {
 
 /** The manifest's projects as an assignment: a merge or a deletion keeps every other thread where it was, with no model call. */
 export function previousAssignment(previous: readonly ManifestProject[]): Assignment {
-  return previous.map(p => ({ name: p.name, description: p.description, threadIds: p.threads.map(t => t.sessionId) }))
+  return previous.map(p => ({ name: p.name, description: p.description, threadIds: p.threads.map(t => t.sessionId), slug: p.slug }))
 }
 
 /** The project the manifest lists a thread under; undefined when it lists it nowhere. */
