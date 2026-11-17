@@ -331,6 +331,101 @@ test('with filing off, a turn files nothing; /judge file still does', { options:
   expect(repo.commits.length).toBe(1)
 })
 
+test('Skip holds a thread out of the manifest; File now files it and lifts the skip', { options: OPTIONS }, async ($, on) => {
+  const start = 1_700_000_000_000
+  const clock = mock.clock(on, { now: start })
+  mock.store(on)
+  const repo = engine(on, start, { files: { 'README.md': 'hi' }, commits: [], modelCalls: 0 })
+  let forks = 0
+  on('model.fork', () => {
+    forks++
+    return { value: { isAnswered: true, text: VERDICT_TEXT, usage: { input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 1, cache_creation_input_tokens: 0 } } }
+  })
+  const turn = async (turnId: string) => {
+    await $.turn.start({ text: 'Go on', turnId })
+    await $.turn.complete({ answer: 'Done.', durationMs: 1000, isAborted: false, turnId, reason: 'answer', usage: USAGE })
+  }
+
+  await $.session.start({ cwd: '/work/app', surface: 'desktop', isInteractive: true })
+  await turn('t1')
+  const band = await $.ui.mount({ ...BAND, surface: 'terminal' })
+  expect((await band.find({ key: 'skip' }))?.props['label']).toBe('Skip')
+  await band.press({ key: 'skip' })
+  expect((await band.find({ type: 'Text', text: /^skipped$/ }))?.text).toBe('skipped')
+  expect((await band.find({ key: 'skip' }))?.props['label']).toBe('Unskip')
+
+  // Neither the filing that was due nor a turn after the skip is filed, and no fork runs.
+  await clock.advance(10 * 60_000)
+  await turn('t2')
+  await clock.advance(10 * 60_000)
+  expect(repo.commits.length).toBe(0)
+  expect(forks).toBe(0)
+
+  // File now files it at once and lifts the skip: the next turn is filed after the pause.
+  await band.press({ key: 'file' })
+  expect(repo.commits.length).toBe(1)
+  expect((await band.find({ key: 'skip' }))?.props['label']).toBe('Skip')
+  await band.unmount()
+  await turn('t3')
+  await clock.advance(2 * 60_000 + 15_000)
+  expect(repo.commits.length).toBe(2)
+})
+
+test('/judge skip and unskip; a skip holds on a resumed session, and a /clear files nothing', { options: OPTIONS }, async ($, on) => {
+  const start = 1_700_000_000_000
+  const clock = mock.clock(on, { now: start })
+  // sess-1 was skipped in an earlier process on this machine.
+  mock.store(on, { skipped: ['sess-1'] })
+  const ids = { current: 'sess-1' }
+  const repo = engine(on, start, { files: { 'README.md': 'hi' }, commits: [], modelCalls: 0 }, undefined, ids)
+  on('model.fork', () => ({ value: { isAnswered: true, text: VERDICT_TEXT, usage: { input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 1, cache_creation_input_tokens: 0 } } }))
+  const turn = async (turnId: string) => {
+    await $.turn.start({ text: 'Go on', turnId })
+    await $.turn.complete({ answer: 'Done.', durationMs: 1000, isAborted: false, turnId, reason: 'answer', usage: USAGE })
+  }
+
+  await $.session.start({ cwd: '/work/app', surface: 'desktop', isInteractive: true })
+  expect((await $.command.run({ command: 'judge', args: '' })).text).toContain('- **Filing:** skipped for this thread')
+  await turn('t1')
+  await clock.advance(30_000)
+  await $.session.end({ reason: 'clear', sessionId: 'sess-1', resume: { id: 'sess-1' } })
+  ids.current = 'sess-2'
+  await $.classic.SessionStart({ source: 'clear' })
+  await clock.advance(5 * 60_000)
+  expect(repo.commits.length).toBe(0)
+
+  // The thread the /clear started is not skipped.
+  const band = await $.ui.mount({ ...BAND, surface: 'desktop' })
+  expect((await band.find({ type: 'Text', text: /^not filed yet$/ }))?.text).toBe('not filed yet')
+  await band.unmount()
+
+  const skipped = await $.command.run({ command: 'judge', args: 'skip' })
+  expect(skipped.text).toContain('**Skipped:** this thread is not filed after its turns')
+  expect((await $.command.run({ command: 'judge', args: 'skip' })).text).toContain('skipped already')
+  await turn('t2')
+  await clock.advance(5 * 60_000)
+  expect(repo.commits.length).toBe(0)
+
+  // Unskipped, the turn the skip held back is filed after the usual pause.
+  const unskipped = await $.command.run({ command: 'judge', args: 'unskip' })
+  expect(unskipped.text).toBe(`**Unskipped:** this thread is filed after each turn again; the turns since the skip file at ${hhmm(clock.now() + 2 * 60_000)}.`)
+  await clock.advance(2 * 60_000 + 15_000)
+  expect(filedEntries(repo).map(f => f.path)).toEqual(['threads/work/sess-2.json'])
+})
+
+test('with filing off there is no Skip, and /judge skip says why', { options: { ...OPTIONS, file_threads: false } }, async ($, on) => {
+  const start = 1_700_000_000_000
+  mock.clock(on, { now: start })
+  mock.store(on)
+  engine(on, start, { files: { 'README.md': 'hi' }, commits: [], modelCalls: 0 })
+
+  await $.session.start({ cwd: '/work/app', surface: 'desktop', isInteractive: true })
+  const band = await $.ui.mount({ ...BAND, surface: 'desktop' })
+  expect(await band.find({ key: 'skip' })).toBe(undefined)
+  await band.unmount()
+  expect((await $.command.run({ command: 'judge', args: 'skip' })).text).toContain('filing after each turn is off')
+})
+
 test('a /clear before the pause files the thread it ends, from its transcript, with no fork', { options: OPTIONS }, async ($, on) => {
   const start = 1_700_000_000_000
   const clock = mock.clock(on, { now: start })

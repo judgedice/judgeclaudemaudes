@@ -119,6 +119,8 @@ const TITLE_MIN = 12
 // and the Threads button beside it.
 const BUTTON_COLUMNS = 14
 const THREADS_BUTTON_COLUMNS = 12
+// A button's room beyond its label.
+const BUTTON_PAD = 6
 // A manifest older than this is read again when the person opens the pane.
 const PANE_FRESH_MS = 5 * 60_000
 // The thread titles the pane's buttons show are cut to this.
@@ -136,6 +138,10 @@ const LIST_TOOL_ID = 'mcp__judge-keep-warm__list_threads'
 const TIDY_TOOL_ID = 'mcp__judge-keep-warm__tidy_threads'
 // What list_threads shows of each summary.
 const TOOL_SUMMARY_MAX = 300
+// The store key that lists the threads skipped on this machine, so a skip holds when the session
+// is resumed in a later process; the newest SKIPS_KEPT are kept.
+const SKIPS_KEY = 'skipped'
+const SKIPS_KEPT = 500
 
 const NOW = { plugin: 'judge-keep-warm', key: 'now' } as const
 const FILE_DUE = { plugin: 'judge-keep-warm', key: 'fileDueAt' } as const
@@ -163,6 +169,7 @@ const PANE_OPEN_THREAD = { plugin: 'judge-keep-warm', key: 'paneOpenThread' } as
 const PANE_OPEN_ARCHIVE = { plugin: 'judge-keep-warm', key: 'paneOpenArchive' } as const
 const TIDY_PLAN = { plugin: 'judge-keep-warm', key: 'tidyPlan' } as const
 const TIDY_OFF = { plugin: 'judge-keep-warm', key: 'tidyOff' } as const
+const SKIPPED = { plugin: 'judge-keep-warm', key: 'skipped' } as const
 
 // The module's own variables start over on a reload; what must survive one is in $.state.
 const live: {
@@ -248,8 +255,61 @@ async function startOver($: EngineInterface) {
   await $.state.set(VERDICT, null)
   await $.state.set(FILING, null)
   await $.state.set(SELF_ARCHIVED, null)
+  await $.state.set(SKIPPED, false)
   await $.state.set(TITLE, '')
   await $.state.set(NOW, await $.clock.now())
+}
+
+// ---- Skipping a thread ------------------------------------------------------------------------
+
+// The session ids skipped on this machine, oldest first.
+async function skippedIds($: EngineInterface) {
+  const raw = await $.store.get(SKIPS_KEY)
+  return Array.isArray(raw) ? raw.filter((id): id is string => typeof id === 'string') : []
+}
+
+// Reads whether this session's thread was skipped, here or in an earlier process.
+async function loadSkip($: EngineInterface) {
+  const id = await $.session.id()
+  await $.state.set(SKIPPED, (await skippedIds($)).includes(id))
+}
+
+// Skips this thread, or lifts the skip, for this process and any later one that resumes it. A
+// skip drops a filing already due; lifting it schedules none (see unskipThread).
+async function setSkipped($: EngineInterface, isSkipped: boolean) {
+  const id = await $.session.id()
+  const ids = (await skippedIds($)).filter(x => x !== id)
+  if (isSkipped) ids.push(id)
+  await $.store.set(SKIPS_KEY, ids.slice(-SKIPS_KEPT))
+  await $.state.set(SKIPPED, isSkipped)
+  if (isSkipped) await $.state.set(FILE_DUE, 0)
+}
+
+// Back to filing after each turn. A turn the skip held back is filed after the usual pause.
+// Answers when that filing is due; 0 when nothing is.
+async function unskipThread($: EngineInterface) {
+  await setSkipped($, false)
+  const { value: active = 0 } = await $.state.get(ACTIVE)
+  const { value: filing = null } = await $.state.get(FILING)
+  const { value: self = null } = await $.state.get(SELF_ARCHIVED)
+  if (!isJudging() || !live.fileThreads || self || active === 0 || (filing?.ok && filing.at >= active)) return 0
+  const due = (await $.clock.now()) + FILE_AFTER_IDLE_MS
+  await $.state.set(FILE_DUE, due)
+  return due
+}
+
+// The Skip and Unskip button on the line and in the pane.
+async function toggleSkip($: EngineInterface) {
+  const { value: skipped = false } = await $.state.get(SKIPPED)
+  if (skipped) await unskipThread($)
+  else await setSkipped($, true)
+}
+
+// File now and /judge file or close: the person asked for this filing, so a skip is lifted first.
+async function fileNow($: EngineInterface, status: ThreadEntry['status']) {
+  const { value: skipped = false } = await $.state.get(SKIPPED)
+  if (skipped) await setSkipped($, false)
+  return judgeAndFile($, status)
 }
 
 // The session's title as the desktop app's list has it, without the mark; '' outside the app.
@@ -1359,7 +1419,8 @@ async function tick($: EngineInterface) {
   if (due === 0 || t < due || live.isTurnRunning || live.isFiling) return
   await $.state.set(FILE_DUE, 0)
   const { value: self = null } = await $.state.get(SELF_ARCHIVED)
-  if (!isJudging() || !live.fileThreads || self) return
+  const { value: skipped = false } = await $.state.get(SKIPPED)
+  if (!isJudging() || !live.fileThreads || self || skipped) return
   await judgeAndFile($, 'open')
 }
 
@@ -1397,6 +1458,7 @@ async function lineModel($: EngineInterface) {
   const { value: flashUntil = 0 } = await $.state.get(FLASH_UNTIL)
   const { value: selfArchived = null } = await $.state.get(SELF_ARCHIVED)
   const { value: manifest = null } = await $.state.get(MANIFEST)
+  const { value: isSkipped = false } = await $.state.get(SKIPPED)
   // Lit for FLASH_MS after a commit to the manifest (green) or a failed filing (red), in place
   // of where the thread stands.
   const isFlash = isJudging() && flashUntil > 0 && (await $.clock.now()) < flashUntil && (flashFailed ? filing !== null : updatedAt > 0)
@@ -1414,6 +1476,8 @@ async function lineModel($: EngineInterface) {
     main = selfArchived.reason === 'merged' ? 'merged into another thread' : 'taken out of the manifest'
   } else if (filingNow) {
     main = 'filing…'
+  } else if (isSkipped) {
+    main = 'skipped'
   } else if (due > 0) {
     main = `files at ${clockTime(due)}`
   } else if (filing && !filing.ok) {
@@ -1439,7 +1503,9 @@ async function lineModel($: EngineInterface) {
   // The tally of this session's updates to the manifest: a fixed part of the line, not a detail.
   const tally = isJudging() && updates > 0 ? plural(updates, 'update') : ''
   const canFile = isJudging() && !selfArchived
-  return { isFlash, flashColor, flashText, main, tone, parts, title, fullTitle, tally, canFile }
+  // Skip, or Unskip once skipped; only where turns are filed by themselves.
+  const skipLabel = canFile && live.fileThreads ? (isSkipped ? 'Unskip' : 'Skip') : ''
+  return { isFlash, flashColor, flashText, main, tone, parts, title, fullTitle, tally, canFile, skipLabel }
 }
 
 // Declares the model's two tools. A host that takes no plugin tools keeps the rest of the mod.
@@ -1493,12 +1559,13 @@ export const register: Register = (on, options) => {
   on('session.start', async ($, e, next) => {
     await $.command.register({
       name: JUDGE_COMMAND,
-      description: 'The thread manifest: status, file or close this thread, list the open threads of this project, open the pane, merge, delete or tidy threads',
-      argumentHint: '[status | file | close | threads | pane | tidy [apply [n…]] | merge <keep> <other>… | delete <id>…]',
+      description: 'The thread manifest: status, file, close or skip this thread, list the open threads of this project, open the pane, merge, delete or tidy threads',
+      argumentHint: '[status | file | close | skip | unskip | threads | pane | tidy [apply [n…]] | merge <keep> <other>… | delete <id>…]',
       immediate: true,
     })
 
     live.sessionId = await $.session.id()
+    await loadSkip($)
     await readVersion($)
     if (isJudging()) await registerTools($)
     for (const key of await $.store.keys()) {
@@ -1526,6 +1593,7 @@ export const register: Register = (on, options) => {
     const id = await $.session.id()
     if (e.source === 'clear' || (live.sessionId !== '' && id !== live.sessionId)) await startOver($)
     live.sessionId = id
+    await loadSkip($)
     if ((e.source === 'resume' || e.source === 'fork') && typeof e.seconds_since_last_response === 'number') {
       const lastAt = (await $.clock.now()) - e.seconds_since_last_response * 1000
       const { value: active = 0 } = await $.state.get(ACTIVE)
@@ -1550,7 +1618,8 @@ export const register: Register = (on, options) => {
         await rememberTitle($)
       }
       const { value: due = 0 } = await $.state.get(FILE_DUE)
-      if (isJudging() && live.fileThreads && (e.usage || due > 0)) await $.state.set(FILE_DUE, t + FILE_AFTER_IDLE_MS)
+      const { value: skipped = false } = await $.state.get(SKIPPED)
+      if (isJudging() && live.fileThreads && !skipped && (e.usage || due > 0)) await $.state.set(FILE_DUE, t + FILE_AFTER_IDLE_MS)
     }
     return next(e)
   })
@@ -1560,7 +1629,8 @@ export const register: Register = (on, options) => {
   // its transcript says, and the next tick, a few seconds on, commits it.
   on('session.end', async ($, e, next) => {
     const { value: due = 0 } = await $.state.get(FILE_DUE)
-    if (due > 0 && (e.reason === 'clear' || e.reason === 'resume') && isJudging() && live.fileThreads) {
+    const { value: skipped = false } = await $.state.get(SKIPPED)
+    if (due > 0 && !skipped && (e.reason === 'clear' || e.reason === 'resume') && isJudging() && live.fileThreads) {
       await $.state.set(FILE_DUE, 0)
       const snap = { ...(await captureThread($)), sessionId: e.sessionId }
       // The judge's project and topics from the last filing still hold; the summary is the transcript's.
@@ -1580,7 +1650,7 @@ export const register: Register = (on, options) => {
       return { text: isPlaced ? '**Judge:** the Judgeiverse pane is open: the line, then the threads.' : '**Judge:** no surface here places a pane; the line is drawn above the prompt where one exists, and `/judge threads` lists the threads.' }
     }
     if (word === 'file' || word === 'close') {
-      const verdict = await judgeAndFile($, word === 'close' ? 'closed' : 'open')
+      const verdict = await fileNow($, word === 'close' ? 'closed' : 'open')
       const { value: filing = null } = await $.state.get(FILING)
       const { value: self = null } = await $.state.get(SELF_ARCHIVED)
       const { value: manifest = null } = await $.state.get(MANIFEST)
@@ -1595,6 +1665,28 @@ export const register: Register = (on, options) => {
       if (verdict.topics.length) facts.push(`- **Topics:** ${verdict.topics.map(mdText).join(', ')}`)
       if (verdict.nextStep) facts.push(`- **Next:** ${mdText(verdict.nextStep)}`)
       if (facts.length) lines.push('', ...facts)
+      return { text: lines.join('\n') }
+    }
+    if (word === 'skip' || word === 'unskip') {
+      const { value: skipped = false } = await $.state.get(SKIPPED)
+      const { value: self = null } = await $.state.get(SELF_ARCHIVED)
+      const { value: manifest = null } = await $.state.get(MANIFEST)
+      if (!live.fileThreads) {
+        return { text: '**Judge:** filing after each turn is off (the **File threads in the manifest** option), so this thread is filed only on `/judge file` already.' }
+      }
+      if (self) return { text: `**Judge:** this thread was ${mdText(selfArchivedText(self, manifest))}; it is not filed again either way.` }
+      if (word === 'unskip') {
+        if (!skipped) return { text: '**Judge:** this thread is not skipped; it is filed after each turn.' }
+        const due = await unskipThread($)
+        return { text: `**Unskipped:** this thread is filed after each turn again${due ? `; the turns since the skip file at ${clockTime(due)}` : ''}.` }
+      }
+      if (skipped) return { text: '**Judge:** this thread is skipped already. `/judge unskip` files it after each turn again.' }
+      await setSkipped($, true)
+      const id = await $.session.id()
+      const { value: filing = null } = await $.state.get(FILING)
+      const isListed = filing?.ok || (manifest?.projects.some(p => p.threads.some(t => t.sessionId === id)) ?? false)
+      const lines = ['**Skipped:** this thread is not filed after its turns or on a `/clear`. `/judge file` files it anyway; `/judge unskip` goes back to filing after each turn.']
+      if (isListed) lines.push('', `An earlier filing of it stays in the manifest; \`/judge delete ${id.slice(0, 8)}\` takes it out.`)
       return { text: lines.join('\n') }
     }
     if (word === 'threads') {
@@ -1654,17 +1746,23 @@ export const register: Register = (on, options) => {
     const { value: manifestProjects = 0 } = await $.state.get(MANIFEST_PROJECTS)
     const { value: updates = 0 } = await $.state.get(UPDATES)
     const { value: updatedAt = 0 } = await $.state.get(UPDATED_AT)
+    const { value: skipped = false } = await $.state.get(SKIPPED)
+    const filingRule = !live.fileThreads
+      ? 'only on `/judge file`'
+      : skipped
+        ? 'skipped for this thread; `/judge unskip` files it after each turn again'
+        : `${minutes(FILE_AFTER_IDLE_MS)} minutes after each turn, once the conversation pauses; \`/judge skip\` stops it for this thread`
     const lines = [
       `**Judge** ${mdText(buildDetail())} · manifest ${mdCode(live.repo)} · account ${mdCode(accountLabel())}`,
       '',
-      `- **Filing:** ${live.fileThreads ? `${minutes(FILE_AFTER_IDLE_MS)} minutes after each turn, once the conversation pauses` : 'only on `/judge file`'}`,
+      `- **Filing:** ${filingRule}`,
       `- **Last filed:** ${filing ? (filing.ok ? `${clockTime(filing.at)}, ${FILED_BY[filing.by]}, at ${mdCode(filing.path)}` : `${clockTime(filing.at)}, failed: ${mdText(filing.error)}`) : 'not yet this session'}`,
     ]
     if (self) lines.push(`- **This thread:** ${mdText(selfArchivedText(self, manifest))}`)
     if (verdict) lines.push(`- **Verdict:** ${mdText(verdict.summary)}${verdict.project ? ` *(project: ${mdText(verdict.project)})*` : ''}`)
     lines.push(`- **Manifest:** ${counter(manifestThreads, manifestProjects, updates).join(' · ') || 'not read yet'}${updatedAt ? `; last updated ${clockTime(updatedAt)}` : ''}`)
     if (related.length) lines.push(`- **This project:** ${plural(related.length, 'other open thread')}; \`/judge threads\` lists them`)
-    lines.push('', '`/judge file` · `/judge close` · `/judge threads` · `/judge pane` · `/judge tidy` · `/judge merge <keep> <other>…` · `/judge delete <id>…`')
+    lines.push('', '`/judge file` · `/judge close` · `/judge skip` · `/judge threads` · `/judge pane` · `/judge tidy` · `/judge merge <keep> <other>…` · `/judge delete <id>…`')
     return { text: lines.join('\n') }
   })
 
@@ -1693,7 +1791,8 @@ export const register: Register = (on, options) => {
     const build = buildLabel()
     const fixed =
       LABEL.length + DETAIL_GAP + build.length + DETAIL_GAP + (m.isFlash ? m.flashText : m.main).length +
-      (m.tally ? DETAIL_GAP + m.tally.length : 0) + (m.canFile ? BUTTON_COLUMNS : 0) + (isJudging() ? THREADS_BUTTON_COLUMNS : 0)
+      (m.tally ? DETAIL_GAP + m.tally.length : 0) + (m.canFile ? BUTTON_COLUMNS : 0) + (isJudging() ? THREADS_BUTTON_COLUMNS : 0) +
+      (m.skipLabel ? m.skipLabel.length + BUTTON_PAD : 0)
     const shown = fitParts(details, e.props.bodyColumns, fixed)
 
     return (
@@ -1729,9 +1828,14 @@ export const register: Register = (on, options) => {
             <Button key="threads" label="Threads" onPress={() => showThreads($)} />
           </Box>
         )}
+        {m.skipLabel !== '' && (
+          <Box flexShrink={0}>
+            <Button key="skip" label={m.skipLabel} onPress={() => void toggleSkip($)} />
+          </Box>
+        )}
         {m.canFile && (
           <Box flexShrink={0}>
-            <Button key="file" label="File now" onPress={() => void judgeAndFile($, 'open')} />
+            <Button key="file" label="File now" onPress={() => void fileNow($, 'open')} />
           </Box>
         )}
       </Box>
@@ -1763,7 +1867,8 @@ export const register: Register = (on, options) => {
         {m.tally !== '' && <Text size="footnote" dimColor>{m.tally}</Text>}
         {m.canFile && (
           <Box columnGap="sm" flexWrap="wrap">
-            <Button key="file" label="File now" onPress={() => void judgeAndFile($, 'open')} />
+            <Button key="file" label="File now" onPress={() => void fileNow($, 'open')} />
+            {m.skipLabel !== '' && <Button key="skip" label={m.skipLabel} onPress={() => void toggleSkip($)} />}
           </Box>
         )}
       </Box>

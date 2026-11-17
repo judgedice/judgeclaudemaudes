@@ -198,6 +198,8 @@ declare module 'claude-code' {
       tidyPlan: TidyPlan | null
       /** The ids of the tidy plan's proposals the person unticked; the rest apply. */
       tidyOff: string[]
+      /** True when the person skipped this thread: no filing after its turns or on a /clear, until File now or /judge unskip. */
+      skipped: boolean
     }
   }
 }
